@@ -53,6 +53,11 @@ public class XdsServer {
     return acks.await(group, version, timeout);
   }
 
+  /** Number of Envoys currently connected in a group. */
+  public long connected(String group) {
+    return acks.connected(group);
+  }
+
   @PreDestroy
   void stop() {
     if (server != null) {

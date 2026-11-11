@@ -15,7 +15,7 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        include: health,info,prometheus
 
 edge:
   xds-port: 18000
@@ -23,6 +23,9 @@ edge:
   probe-requests-per-host: 25
   max-error-rate: 0.05
   ack-timeout-millis: 5000
+  probe: synthetic            # or "prometheus": canary error rate from real traffic
+  prometheus-url: http://kps-prometheus.monitoring.svc.cluster.local:9090
+  probe-window-seconds: 30    # how long the prometheus probe watches the canary
   backends:
     tableau: tableau:8080
     sales: sales:8080

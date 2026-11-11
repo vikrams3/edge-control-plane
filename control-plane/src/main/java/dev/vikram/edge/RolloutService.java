@@ -1,5 +1,8 @@
 package dev.vikram.edge;
 
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import jakarta.annotation.PostConstruct;
 import java.time.Duration;
 import java.time.Instant;
@@ -34,6 +37,7 @@ public class RolloutService {
   private final RolloutPolicy policy;
   private final EdgeProperties props;
   private final RolloutRepository repo;
+  private final MeterRegistry metrics;
 
   private final AtomicLong version = new AtomicLong();
   private final AtomicReference<Map<String, String>> stableRoutes = new AtomicReference<>();
@@ -41,12 +45,13 @@ public class RolloutService {
   private final ReentrantLock rolloutLock = new ReentrantLock();
 
   public RolloutService(XdsServer xds, HealthProbe probe, RolloutPolicy policy,
-      EdgeProperties props, RolloutRepository repo) {
+      EdgeProperties props, RolloutRepository repo, MeterRegistry metrics) {
     this.xds = xds;
     this.probe = probe;
     this.policy = policy;
     this.props = props;
     this.repo = repo;
+    this.metrics = metrics;
   }
 
   /**
@@ -56,6 +61,12 @@ public class RolloutService {
    */
   @PostConstruct
   void init() {
+    for (String group : List.of(CANARY, STABLE)) {
+      Gauge.builder("edge.envoys.connected", xds, x -> x.connected(group))
+          .description("Envoys connected over ADS").tag("group", group).register(metrics);
+    }
+    Gauge.builder("edge.config.version", version, AtomicLong::get)
+        .description("Latest xDS snapshot version pushed").register(metrics);
     version.set(repo.maxVersion());
     Map<String, String> routes = Map.copyOf(props.initialRoutes());
     String source = "initial routes from config";
@@ -112,6 +123,7 @@ public class RolloutService {
     if (!rolloutLock.tryLock()) {
       return Optional.empty();
     }
+    Timer.Sample timer = Timer.start(metrics);
     try {
       Map<String, String> routes = Map.copyOf(candidate);
       long v = push(CANARY, routes);
@@ -140,6 +152,9 @@ public class RolloutService {
           ack.name().toLowerCase(), result.total(), result.failed(), result.errorRate(),
           revertedFrom);
       repo.save(RolloutEntity.from(record));
+      metrics.counter("edge.rollouts", "outcome", outcome, "canary_ack", record.canaryAck())
+          .increment();
+      timer.stop(metrics.timer("edge.rollout.duration", "outcome", outcome));
       return Optional.of(record);
     } finally {
       rolloutLock.unlock();

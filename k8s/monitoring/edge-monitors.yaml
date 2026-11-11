@@ -1,0 +1,58 @@
+# Scrape every Envoy's admin stats, labelled with its group (canary or stable).
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata: {name: envoy, namespace: edge}
+spec:
+  selector:
+    matchExpressions: [{key: app, operator: In, values: [envoy-canary, envoy-stable]}]
+  podMetricsEndpoints:
+  - port: admin
+    path: /stats/prometheus
+    interval: 5s                  # PrometheusHealthProbe assumes 5 s
+    relabelings:
+    - sourceLabels: [__meta_kubernetes_pod_label_app]
+      regex: envoy-(.*)
+      targetLabel: group
+---
+# The control plane's Micrometer metrics: rollouts, rollout duration, connected Envoys, version.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata: {name: control-plane, namespace: edge}
+spec:
+  selector:
+    matchLabels: {app: control-plane}
+  endpoints:
+  - port: http
+    path: /actuator/prometheus
+    interval: 15s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata: {name: edge-alerts, namespace: edge}
+spec:
+  groups:
+  - name: edge
+    rules:
+    - alert: EdgeHigh5xxRate
+      expr: |
+        sum by (group) (rate(envoy_http_downstream_rq_xx{envoy_http_conn_manager_prefix="edge",envoy_response_code_class="5"}[2m]))
+          /
+        sum by (group) (rate(envoy_http_downstream_rq_completed{envoy_http_conn_manager_prefix="edge"}[2m]))
+          > 0.05
+      for: 1m
+      labels: {severity: critical}
+      annotations:
+        summary: "{{ $labels.group }} Envoys are returning {{ $value | humanizePercentage }} 5xx"
+        runbook: "Check the last rollout (GET /v1/rollouts) and revert it with POST /v1/rollouts/{version}/revert"
+    - alert: EdgeStableEnvoysDisconnected
+      expr: edge_envoys_connected{group="stable"} < 1
+      for: 1m
+      labels: {severity: warning}
+      annotations:
+        summary: "No stable Envoy is connected to the control plane; they keep serving their last config"
+    - alert: EdgeControlPlaneDown
+      expr: absent(up{job="control-plane", namespace="edge"} == 1)
+      for: 1m
+      labels: {severity: warning}
+      annotations:
+        summary: "Control plane is down: Envoys keep serving, but no route changes or rollbacks are possible"

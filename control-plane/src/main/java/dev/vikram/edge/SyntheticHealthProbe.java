@@ -11,6 +11,7 @@ import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
 /**
@@ -18,6 +19,7 @@ import org.springframework.stereotype.Component;
  * and counts anything that is not a 2xx as a failure.
  */
 @Component
+@ConditionalOnProperty(name = "edge.probe", havingValue = "synthetic", matchIfMissing = true)
 public class SyntheticHealthProbe implements HealthProbe {
 
   private final URI canary;

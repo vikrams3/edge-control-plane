@@ -2,6 +2,9 @@ package dev.vikram.edge;
 
 import com.google.protobuf.Any;
 import com.google.protobuf.Duration;
+import com.google.protobuf.Struct;
+import com.google.protobuf.Value;
+import io.envoyproxy.envoy.config.accesslog.v3.AccessLog;
 import io.envoyproxy.controlplane.cache.v3.Snapshot;
 import io.envoyproxy.envoy.config.cluster.v3.Cluster;
 import io.envoyproxy.envoy.config.core.v3.Address;
@@ -9,6 +12,7 @@ import io.envoyproxy.envoy.config.core.v3.AggregatedConfigSource;
 import io.envoyproxy.envoy.config.core.v3.ApiVersion;
 import io.envoyproxy.envoy.config.core.v3.ConfigSource;
 import io.envoyproxy.envoy.config.core.v3.SocketAddress;
+import io.envoyproxy.envoy.config.core.v3.SubstitutionFormatString;
 import io.envoyproxy.envoy.config.endpoint.v3.ClusterLoadAssignment;
 import io.envoyproxy.envoy.config.endpoint.v3.Endpoint;
 import io.envoyproxy.envoy.config.endpoint.v3.LbEndpoint;
@@ -21,10 +25,12 @@ import io.envoyproxy.envoy.config.route.v3.RouteAction;
 import io.envoyproxy.envoy.config.route.v3.RouteConfiguration;
 import io.envoyproxy.envoy.config.route.v3.RouteMatch;
 import io.envoyproxy.envoy.config.route.v3.VirtualHost;
+import io.envoyproxy.envoy.extensions.access_loggers.stream.v3.StdoutAccessLog;
 import io.envoyproxy.envoy.extensions.filters.http.router.v3.Router;
 import io.envoyproxy.envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager;
 import io.envoyproxy.envoy.extensions.filters.network.http_connection_manager.v3.HttpFilter;
 import io.envoyproxy.envoy.extensions.filters.network.http_connection_manager.v3.Rds;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -96,6 +102,7 @@ public final class EdgeConfig {
         .addHttpFilters(HttpFilter.newBuilder()
             .setName("envoy.filters.http.router")
             .setTypedConfig(Any.pack(Router.getDefaultInstance())))
+        .addAccessLog(accessLog())
         .build();
 
     return Listener.newBuilder()
@@ -105,6 +112,40 @@ public final class EdgeConfig {
             .addFilters(Filter.newBuilder()
                 .setName("envoy.filters.network.http_connection_manager")
                 .setTypedConfig(Any.pack(hcm))))
+        .build();
+  }
+
+  /** Fields of the JSON access log line, as Envoy format operators. */
+  static final Map<String, String> ACCESS_LOG_FIELDS = accessLogFields();
+
+  private static Map<String, String> accessLogFields() {
+    Map<String, String> f = new LinkedHashMap<>();
+    f.put("start_time", "%START_TIME%");
+    f.put("node", "%ENVIRONMENT(HOSTNAME)%");
+    f.put("method", "%REQ(:METHOD)%");
+    f.put("authority", "%REQ(:AUTHORITY)%");
+    f.put("path", "%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%");
+    f.put("status", "%RESPONSE_CODE%");
+    f.put("flags", "%RESPONSE_FLAGS%");        // e.g. UF = upstream connect failure, NR = no route
+    f.put("backend", "%UPSTREAM_CLUSTER%");
+    f.put("duration_ms", "%DURATION%");
+    f.put("upstream_ms", "%RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)%");
+    f.put("bytes_out", "%BYTES_SENT%");
+    f.put("request_id", "%REQ(X-REQUEST-ID)%");
+    return Map.copyOf(f);
+  }
+
+  /** One JSON line per request on Envoy's stdout; Phase 3 ships these to Kafka. */
+  static AccessLog accessLog() {
+    Struct.Builder json = Struct.newBuilder();
+    new TreeMap<>(ACCESS_LOG_FIELDS).forEach(
+        (k, v) -> json.putFields(k, Value.newBuilder().setStringValue(v).build()));
+    StdoutAccessLog stdout = StdoutAccessLog.newBuilder()
+        .setLogFormat(SubstitutionFormatString.newBuilder().setJsonFormat(json))
+        .build();
+    return AccessLog.newBuilder()
+        .setName("envoy.access_loggers.stdout")
+        .setTypedConfig(Any.pack(stdout))
         .build();
   }
 

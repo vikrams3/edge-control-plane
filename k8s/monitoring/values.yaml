@@ -1,0 +1,30 @@
+# kube-prometheus-stack, trimmed for a laptop kind cluster.
+fullnameOverride: kps
+
+prometheus:
+  prometheusSpec:
+    # pick up PodMonitors, ServiceMonitors and rules from any namespace, not only Helm-labelled ones
+    podMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    retention: 2d
+    resources:
+      requests: {cpu: 200m, memory: 400Mi}
+
+alertmanager:
+  alertmanagerSpec:
+    resources:
+      requests: {cpu: 20m, memory: 32Mi}
+
+grafana:
+  adminPassword: admin            # local demo only
+  defaultDashboardsTimezone: browser
+  sidecar:
+    dashboards:
+      searchNamespace: ALL        # dashboards come from ConfigMaps labelled grafana_dashboard=1
+
+# kind does not expose these control-plane components, so their scrapes would only fail
+kubeEtcd: {enabled: false}
+kubeScheduler: {enabled: false}
+kubeControllerManager: {enabled: false}
+kubeProxy: {enabled: false}

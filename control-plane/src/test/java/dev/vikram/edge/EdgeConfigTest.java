@@ -28,4 +28,15 @@ class EdgeConfigTest {
     assertThat(addr.getAddress()).isEqualTo("sales");
     assertThat(addr.getPortValue()).isEqualTo(8080);
   }
+
+  @Test
+  void listenerWritesJsonAccessLog() throws Exception {
+    var hcm = EdgeConfig.listener().getFilterChains(0).getFilters(0).getTypedConfig()
+        .unpack(io.envoyproxy.envoy.extensions.filters.network.http_connection_manager.v3
+            .HttpConnectionManager.class);
+    var log = hcm.getAccessLog(0).getTypedConfig()
+        .unpack(io.envoyproxy.envoy.extensions.access_loggers.stream.v3.StdoutAccessLog.class);
+    assertThat(log.getLogFormat().getJsonFormat().getFieldsMap())
+        .containsKeys("status", "flags", "backend", "duration_ms", "authority");
+  }
 }

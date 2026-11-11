@@ -6,7 +6,7 @@ spec:
   replicas: 1
   selector: {matchLabels: {app: envoy-canary}}
   template:
-    metadata: {labels: {app: envoy-canary}}
+    metadata: {labels: {app: envoy-canary, tier: edge}}
     spec:
       containers:
       - name: envoy

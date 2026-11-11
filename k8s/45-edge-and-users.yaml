@@ -1,0 +1,33 @@
+# "edge" is what real users hit: it spreads requests across every Envoy, so the canary
+# (1 of 3 pods) carries about a third of live traffic. That is what PrometheusHealthProbe measures.
+apiVersion: v1
+kind: Service
+metadata: {name: edge, namespace: edge}
+spec:
+  selector: {tier: edge}
+  ports: [{name: http, port: 10000}]
+---
+# Steady background "users": about 4 requests/s to each hostname, forever.
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: users, namespace: edge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: users}}
+  template:
+    metadata: {labels: {app: users}}
+    spec:
+      containers:
+      - name: users
+        image: edge-hey:dev           # built and loaded by scripts/kind-up.sh
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c"]
+        args:
+        - |
+          for host in tableau.edge.local sales.edge.local crm.edge.local; do
+            # a new connection per request, so kube-proxy spreads requests (not just connections)
+            (while true; do hey -z 10m -c 2 -q 2 -disable-keepalive -host "$host" http://edge.edge.svc.cluster.local:10000/ >/dev/null; done) &
+          done
+          wait
+        resources:
+          requests: {cpu: 20m, memory: 16Mi}

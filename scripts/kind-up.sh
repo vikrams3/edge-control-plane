@@ -40,5 +40,9 @@ kubectl -n edge rollout status deployment/envoy-stable --timeout=120s
 kubectl -n edge rollout status deployment/tableau --timeout=120s
 kubectl -n edge rollout status deployment/sales --timeout=120s
 
+if [ "${MONITORING:-1}" = 1 ]; then
+  ./scripts/monitoring-up.sh      # skip with MONITORING=0
+fi
+
 echo "==> Port-forwarding (control plane :8080, stable Envoy :10000, canary Envoy :10001)"
 ./scripts/port-forward.sh

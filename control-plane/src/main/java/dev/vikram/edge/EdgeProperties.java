@@ -13,6 +13,9 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * @param probeRequestsPerHost requests the probe sends through the canary for each hostname
  * @param maxErrorRate highest canary error rate that still promotes, for example 0.05
  * @param ackTimeoutMillis how long to wait for every canary Envoy to ACK a new version
+ * @param probe which HealthProbe to use: "synthetic" (default) or "prometheus"
+ * @param prometheusUrl Prometheus base URL, used by the prometheus probe
+ * @param probeWindowSeconds how long the prometheus probe watches real canary traffic
  */
 @ConfigurationProperties(prefix = "edge")
 public record EdgeProperties(
@@ -22,4 +25,7 @@ public record EdgeProperties(
     Map<String, String> initialRoutes,
     int probeRequestsPerHost,
     double maxErrorRate,
-    long ackTimeoutMillis) {}
+    long ackTimeoutMillis,
+    String probe,
+    String prometheusUrl,
+    int probeWindowSeconds) {}
