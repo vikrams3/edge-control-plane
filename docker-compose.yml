@@ -5,6 +5,7 @@ services:
   control-plane:
     build: ./control-plane
     ports: ["8080:8080"]
+    volumes: ["./certs:/etc/edge/tls:ro"]   # from scripts/gen-certs.sh; without it, HTTP only
     depends_on:
       postgres: {condition: service_healthy}
 
@@ -23,14 +24,14 @@ services:
     image: envoyproxy/envoy:v1.31-latest
     command: ["-c", "/etc/envoy/envoy.yaml", "--service-cluster", "canary", "--service-node", "envoy-canary"]
     volumes: ["./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro"]
-    ports: ["10001:10000", "9902:9901"]
+    ports: ["10001:10000", "10444:10443", "9902:9901"]
     depends_on: [control-plane]
 
   envoy-stable:
     image: envoyproxy/envoy:v1.31-latest
     command: ["-c", "/etc/envoy/envoy.yaml", "--service-cluster", "stable", "--service-node", "envoy-stable"]
     volumes: ["./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro"]
-    ports: ["10000:10000", "9901:9901"]
+    ports: ["10000:10000", "10443:10443", "9901:9901"]
     depends_on: [control-plane]
 
   tableau:

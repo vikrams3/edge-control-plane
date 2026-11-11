@@ -19,6 +19,7 @@ spec:
           valueFrom: {fieldRef: {fieldPath: metadata.name}}
         ports:
         - {name: http, containerPort: 10000}
+        - {name: https, containerPort: 10443}
         - {name: admin, containerPort: 9901}
         volumeMounts: [{name: bootstrap, mountPath: /etc/envoy}]
         resources:
@@ -32,4 +33,4 @@ kind: Service
 metadata: {name: envoy-stable, namespace: edge}
 spec:
   selector: {app: envoy-stable}
-  ports: [{name: http, port: 10000}]
+  ports: [{name: http, port: 10000}, {name: https, port: 10443}]

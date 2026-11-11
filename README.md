@@ -30,13 +30,14 @@ flowchart LR
 - **Rollout:** `POST /v1/rollouts` first rejects unknown backends with `400`. It then pushes the new route table to the canary group and waits until every canary Envoy ACKs that version over xDS (up to 5 s). Next it sends 25 test requests per hostname through the canary in parallel (virtual threads), and promotes or rolls back based on the error rate. A NACK, a timeout or no connected canary means an immediate rollback, with no probe.
 - **Probes:** two `HealthProbe` strategies, chosen with `edge.probe`. `synthetic` (the default) sends 25 test requests per hostname through the canary, which is fast and needs no traffic. `prometheus` watches real user traffic on the canary for 30 s and asks Prometheus for its 5xx ratio. No traffic means no evidence, which counts as a failure.
 - **Observability (kind):** Prometheus scrapes every Envoy (labelled by group) and the control plane's Micrometer metrics. Grafana has an "Edge control plane" dashboard showing req/s, 5xx ratio and p99 per group and per backend, plus rollouts and connected Envoys. Alertmanager has three rules: 5xx above 5%, stable Envoys disconnected, control plane down. Every Envoy writes one JSON access-log line per request.
+- **TLS:** with a certificate in `certs/` (`./scripts/gen-certs.sh` makes a self-signed `*.edge.local` one), every Envoy also serves HTTPS on `:10443`. The certificate is not in the bootstrap: the control plane sends it as an SDS secret on the same ADS stream, and reads the files on every push, so rotating means updating the Secret and pushing. Both listeners share one route table, access log and stat prefix.
 - **State:** every rollout is a row in PostgreSQL (Spring Data JPA, schema by Flyway). On startup the control plane restores the last promoted routes and continues version numbers from the database. `POST /v1/rollouts/{version}/revert` rolls out an earlier version's routes again, through the canary like any other change.
 
 ## Code tour
 
 | File | What it does |
 | --- | --- |
-| `EdgeConfig.java` | Builds Envoy listener (with a JSON access log), route table and clusters from a `hostname -> backend` map |
+| `EdgeConfig.java` | Builds Envoy listeners (HTTP, and HTTPS with an SDS certificate), route table, clusters and JSON access log from a `hostname -> backend` map |
 | `XdsServer.java` | gRPC ADS server; one snapshot per Envoy group |
 | `ConfigAckTracker.java` | xDS callbacks that record which route version each Envoy ACKed or NACKed; rollouts wait on it |
 | `RolloutService.java` | Validate, canary, wait for ACK, probe, promote or roll back; one rollout at a time (`ReentrantLock`, 409 otherwise) |
@@ -67,6 +68,7 @@ You need Docker Desktop on your Mac. Java and Maven are optional, because the im
 ### Option A: Docker only (fastest)
 
 ```bash
+./scripts/gen-certs.sh        # optional: enables HTTPS on :10443 (kind-up.sh does this itself)
 docker compose up --build -d
 ./scripts/demo.sh
 docker compose down
@@ -85,7 +87,7 @@ kind delete cluster --name edge
 
 On kind, Grafana is at `localhost:3000` (admin/admin, dashboard "Edge control plane"), Prometheus at `:9090` and Alertmanager at `:9093`. To use the real-traffic probe: `kubectl -n edge set env deploy/control-plane EDGE_PROBE=prometheus`.
 
-Both options expose the control plane on `localhost:8080`, the stable Envoy on `localhost:10000` and the canary Envoy on `localhost:10001`. Envoy's admin page is useful for debugging: `localhost:9901/config_dump` in Docker mode.
+Both options expose the control plane on `localhost:8080`, the stable Envoy on `localhost:10000` (HTTPS `:10443`) and the canary Envoy on `localhost:10001`. Try `curl --cacert certs/tls.crt --resolve sales.edge.local:10443:127.0.0.1 https://sales.edge.local:10443/`. Envoy's admin page is useful for debugging: `localhost:9901/config_dump` in Docker mode.
 
 ## Demo output
 
@@ -150,11 +152,12 @@ Getting here took three tuning runs. Each row is the steady state at the end of 
 - **"Pushed" is not "applied".** The first version slept 2 s after each push and hoped the canary had the new routes. Now the control plane watches xDS ACKs and NACKs, and starts probing as soon as every canary Envoy confirms the version. A good rollout went from about 2.1 s to 0.4 s, and a canary that is missing or rejects the config can no longer be probed on stale routes.
 - **More pods did not help until the real bottlenecks were gone.** Raising the HPA cap from 8 to 16 lowered throughput, because each pod was throttled at its 500m CPU limit. Removing the limit (keeping the request the HPA scales on) took throughput from 339 to 450 req/s. The p50 still sat at exactly 50 ms, which I first blamed on throttling. That was wrong: one request at a time took 52 ms for 8 ms of work. Python writes headers and body separately, and on a kept-alive connection Nagle's algorithm plus delayed ACK held each reply about 40 ms. With `TCP_NODELAY` a request takes 8 ms through Envoy, and throughput reached about 690 req/s.
 - **Kubernetes balances connections, not requests.** The first simulated users kept connections alive, and kube-proxy pinned them at random, so the canary got 16% of traffic instead of 33%. Opening a connection per request fixed the split. Real clients behave the same way, which is why a request-level canary split belongs in Envoy (`weighted_clusters`), not in the Service.
+- **TLS added two surprises.** HTTPS clients on a non-default port send `Host: sales.edge.local:10443`, which matched no virtual host, so every request returned 404 until the connection manager set `strip_any_host_port`. Also, rotation is real: after `kubectl apply` of a new Secret, the kubelet took about 55 s to update the mounted files, and the next push served the new certificate without restarting Envoy. One caveat: the private key travels inside the xDS snapshot, so in production the xDS channel itself must use mTLS, or keys should come from a local SDS agent.
 - **A synthetic probe is a blunt instrument.** It only tests the hostnames in the change and only `GET /`. Real traffic metrics from Envoy (Prometheus) are the better signal.
 
 ## Roadmap
 
-1. **Operate it like production:** TLS termination with SDS, Testcontainers test against a real Envoy, Jenkins pipeline, GKE.
+1. **Operate it like production:** Testcontainers test against a real Envoy, Jenkins pipeline, GKE.
 2. **Analytics and self-optimizing:** Envoy access logs to Kafka, a Kafka Streams job computing per-route error rate and p99, the control plane shifting `weighted_clusters` toward the faster backend pool, long-lived streaming (LLM-style) load tests, cross-cloud failover from GKE to AWS by Envoy priority.
 
 ## License

@@ -16,6 +16,8 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * @param probe which HealthProbe to use: "synthetic" (default) or "prometheus"
  * @param prometheusUrl Prometheus base URL, used by the prometheus probe
  * @param probeWindowSeconds how long the prometheus probe watches real canary traffic
+ * @param tlsCertFile PEM certificate chain for HTTPS on :10443; HTTPS is off if unset or missing
+ * @param tlsKeyFile PEM private key for that certificate
  */
 @ConfigurationProperties(prefix = "edge")
 public record EdgeProperties(
@@ -28,4 +30,6 @@ public record EdgeProperties(
     long ackTimeoutMillis,
     String probe,
     String prometheusUrl,
-    int probeWindowSeconds) {}
+    int probeWindowSeconds,
+    String tlsCertFile,
+    String tlsKeyFile) {}

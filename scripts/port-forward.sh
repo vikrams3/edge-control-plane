@@ -3,7 +3,7 @@
 set -euo pipefail
 pkill -f "kubectl -n (edge|monitoring) port-forward" 2>/dev/null || true
 kubectl -n edge port-forward svc/control-plane 8080:8080 >/dev/null 2>&1 &
-kubectl -n edge port-forward svc/envoy-stable 10000:10000 >/dev/null 2>&1 &
+kubectl -n edge port-forward svc/envoy-stable 10000:10000 10443:10443 >/dev/null 2>&1 &
 kubectl -n edge port-forward svc/envoy-canary 10001:10000 >/dev/null 2>&1 &
 if kubectl get namespace monitoring >/dev/null 2>&1; then
   kubectl -n monitoring port-forward svc/kps-grafana 3000:80 >/dev/null 2>&1 &

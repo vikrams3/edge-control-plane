@@ -31,6 +31,9 @@ fi
 
 echo "==> Deploying"
 kubectl apply -f k8s/00-namespace.yaml
+[ -f certs/tls.crt ] || ./scripts/gen-certs.sh
+kubectl -n edge create secret tls edge-tls --cert=certs/tls.crt --key=certs/tls.key \
+  --dry-run=client -o yaml | kubectl apply -f -
 kubectl apply -f k8s/
 kubectl -n edge rollout status statefulset/postgres --timeout=180s
 kubectl -n edge rollout restart deployment/control-plane   # pick up a rebuilt image

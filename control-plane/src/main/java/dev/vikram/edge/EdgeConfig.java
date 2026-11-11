@@ -11,8 +11,10 @@ import io.envoyproxy.envoy.config.core.v3.Address;
 import io.envoyproxy.envoy.config.core.v3.AggregatedConfigSource;
 import io.envoyproxy.envoy.config.core.v3.ApiVersion;
 import io.envoyproxy.envoy.config.core.v3.ConfigSource;
+import io.envoyproxy.envoy.config.core.v3.DataSource;
 import io.envoyproxy.envoy.config.core.v3.SocketAddress;
 import io.envoyproxy.envoy.config.core.v3.SubstitutionFormatString;
+import io.envoyproxy.envoy.config.core.v3.TransportSocket;
 import io.envoyproxy.envoy.config.endpoint.v3.ClusterLoadAssignment;
 import io.envoyproxy.envoy.config.endpoint.v3.Endpoint;
 import io.envoyproxy.envoy.config.endpoint.v3.LbEndpoint;
@@ -30,35 +32,97 @@ import io.envoyproxy.envoy.extensions.filters.http.router.v3.Router;
 import io.envoyproxy.envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager;
 import io.envoyproxy.envoy.extensions.filters.network.http_connection_manager.v3.HttpFilter;
 import io.envoyproxy.envoy.extensions.filters.network.http_connection_manager.v3.Rds;
+import io.envoyproxy.envoy.extensions.transport_sockets.tls.v3.CommonTlsContext;
+import io.envoyproxy.envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext;
+import io.envoyproxy.envoy.extensions.transport_sockets.tls.v3.Secret;
+import io.envoyproxy.envoy.extensions.transport_sockets.tls.v3.SdsSecretConfig;
+import io.envoyproxy.envoy.extensions.transport_sockets.tls.v3.TlsCertificate;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.TreeMap;
 
 /**
  * Turns a simple "hostname -> backend" route table into Envoy xDS resources:
- * one listener on :10000, one route configuration, and one cluster per backend.
+ * an HTTP listener on :10000, an HTTPS listener on :10443 when a certificate is configured
+ * (delivered over SDS), one route configuration shared by both, and one cluster per backend.
  */
 public final class EdgeConfig {
 
   public static final String LISTENER_NAME = "edge_listener";
   public static final String ROUTE_CONFIG_NAME = "edge_routes";
   public static final int LISTENER_PORT = 10000;
+  public static final String TLS_LISTENER_NAME = "edge_tls_listener";
+  public static final int TLS_LISTENER_PORT = 10443;
+  public static final String CERT_SECRET_NAME = "edge_cert";
+
+  /** A PEM certificate chain and private key for TLS termination. */
+  public record TlsCert(String certificateChainPem, String privateKeyPem) {
+    @Override
+    public String toString() {
+      return "TlsCert[redacted]";   // never log the private key
+    }
+  }
 
   private EdgeConfig() {}
 
-  /** Builds a complete, versioned snapshot for one group of Envoys. */
+  /** Builds a complete, versioned snapshot for one group of Envoys, without TLS. */
   public static Snapshot snapshot(Map<String, String> backends, Map<String, String> routes, String version) {
+    return snapshot(backends, routes, Optional.empty(), version);
+  }
+
+  /** Builds a complete, versioned snapshot; with a certificate it also serves HTTPS on :10443. */
+  public static Snapshot snapshot(Map<String, String> backends, Map<String, String> routes,
+      Optional<TlsCert> tls, String version) {
     List<Cluster> clusters = new TreeMap<>(backends).entrySet().stream()
         .map(e -> cluster(e.getKey(), e.getValue()))
         .toList();
+    List<Listener> listeners = new ArrayList<>(List.of(listener()));
+    tls.ifPresent(c -> listeners.add(tlsListener()));
     return Snapshot.create(
         clusters,
         List.of(),                      // endpoints are inline in each cluster (STRICT_DNS)
-        List.of(listener()),
+        listeners,
         List.of(routeTable(routes)),
-        List.of(),                      // secrets (TLS) come in Phase 2
+        tls.map(c -> List.of(certSecret(c))).orElse(List.of()),   // SDS
         version);
+  }
+
+  /**
+   * HTTPS listener. Its certificate is not inline: Envoy fetches the secret "edge_cert" over SDS
+   * on the same ADS stream, so a rotated certificate only needs a new snapshot.
+   */
+  static Listener tlsListener() {
+    DownstreamTlsContext tls = DownstreamTlsContext.newBuilder()
+        .setCommonTlsContext(CommonTlsContext.newBuilder()
+            .addTlsCertificateSdsSecretConfigs(SdsSecretConfig.newBuilder()
+                .setName(CERT_SECRET_NAME)
+                .setSdsConfig(ConfigSource.newBuilder()
+                    .setAds(AggregatedConfigSource.getDefaultInstance())
+                    .setResourceApiVersion(ApiVersion.V3))))
+        .build();
+    return Listener.newBuilder()
+        .setName(TLS_LISTENER_NAME)
+        .setAddress(address("0.0.0.0", TLS_LISTENER_PORT))
+        .addFilterChains(FilterChain.newBuilder()
+            .addFilters(Filter.newBuilder()
+                .setName("envoy.filters.network.http_connection_manager")
+                .setTypedConfig(Any.pack(httpConnectionManager())))
+            .setTransportSocket(TransportSocket.newBuilder()
+                .setName("envoy.transport_sockets.tls")
+                .setTypedConfig(Any.pack(tls))))
+        .build();
+  }
+
+  static Secret certSecret(TlsCert cert) {
+    return Secret.newBuilder()
+        .setName(CERT_SECRET_NAME)
+        .setTlsCertificate(TlsCertificate.newBuilder()
+            .setCertificateChain(DataSource.newBuilder().setInlineString(cert.certificateChainPem()))
+            .setPrivateKey(DataSource.newBuilder().setInlineString(cert.privateKeyPem())))
+        .build();
   }
 
   /** One virtual host per hostname, each sending all paths to its backend cluster. */
@@ -92,8 +156,25 @@ public final class EdgeConfig {
 
   /** HTTP listener whose routes are fetched separately over RDS on the same ADS stream. */
   static Listener listener() {
-    HttpConnectionManager hcm = HttpConnectionManager.newBuilder()
+    return Listener.newBuilder()
+        .setName(LISTENER_NAME)
+        .setAddress(address("0.0.0.0", LISTENER_PORT))
+        .addFilterChains(FilterChain.newBuilder()
+            .addFilters(Filter.newBuilder()
+                .setName("envoy.filters.network.http_connection_manager")
+                .setTypedConfig(Any.pack(httpConnectionManager()))))
+        .build();
+  }
+
+  /**
+   * HTTP handling shared by both listeners: same route table over RDS, same access log, and the
+   * same stat prefix "edge", so dashboards and the Prometheus probe count HTTP and HTTPS together.
+   */
+  static HttpConnectionManager httpConnectionManager() {
+    return HttpConnectionManager.newBuilder()
         .setStatPrefix("edge")
+        // match "sales.edge.local:10443" to the virtual host "sales.edge.local"
+        .setStripAnyHostPort(true)
         .setRds(Rds.newBuilder()
             .setRouteConfigName(ROUTE_CONFIG_NAME)
             .setConfigSource(ConfigSource.newBuilder()
@@ -103,15 +184,6 @@ public final class EdgeConfig {
             .setName("envoy.filters.http.router")
             .setTypedConfig(Any.pack(Router.getDefaultInstance())))
         .addAccessLog(accessLog())
-        .build();
-
-    return Listener.newBuilder()
-        .setName(LISTENER_NAME)
-        .setAddress(address("0.0.0.0", LISTENER_PORT))
-        .addFilterChains(FilterChain.newBuilder()
-            .addFilters(Filter.newBuilder()
-                .setName("envoy.filters.network.http_connection_manager")
-                .setTypedConfig(Any.pack(hcm))))
         .build();
   }
 

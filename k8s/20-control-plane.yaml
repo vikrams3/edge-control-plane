@@ -28,11 +28,15 @@ spec:
           valueFrom: {secretKeyRef: {name: postgres, key: username}}
         - name: SPRING_DATASOURCE_PASSWORD
           valueFrom: {secretKeyRef: {name: postgres, key: password}}
+        volumeMounts: [{name: tls, mountPath: /etc/edge/tls, readOnly: true}]
         readinessProbe:
           httpGet: {path: /actuator/health, port: 8080}
           initialDelaySeconds: 5
         resources:
           requests: {cpu: 250m, memory: 384Mi}
+      volumes:
+      - name: tls
+        secret: {secretName: edge-tls, optional: true}   # created by kind-up.sh from certs/
 ---
 apiVersion: v1
 kind: Service

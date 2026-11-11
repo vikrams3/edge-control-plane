@@ -2,6 +2,7 @@
 # Walks through the demo: route traffic, promote a good change, auto-roll-back a bad one.
 # Works in both modes (docker compose, or kind with scripts/port-forward.sh running).
 set -euo pipefail
+cd "$(dirname "$0")/.."
 
 CP=${CP:-http://localhost:8080}
 EDGE=${EDGE:-http://localhost:10000}
@@ -40,6 +41,13 @@ curl -s -X POST "$CP/v1/rollouts?wait=true" -H 'Content-Type: application/json' 
   "crm.edge.local": "billing"}'; echo
 echo -n "crm.edge.local on stable is still fine -> "; curl -s -H 'Host: crm.edge.local' "$EDGE/"
 pause
+
+if [ -f certs/tls.crt ]; then
+  step "Same routes over HTTPS: Envoy terminates TLS with a certificate sent over SDS"
+  echo -n "https://sales.edge.local:10443 -> "
+  curl -s --cacert certs/tls.crt --resolve sales.edge.local:10443:127.0.0.1 https://sales.edge.local:10443/
+  pause
+fi
 
 step "Rollout history"
 curl -s "$CP/v1/rollouts"; echo

@@ -3,3 +3,4 @@ control-plane/target/
 *.iml
 .vscode/
 .DS_Store
+certs/

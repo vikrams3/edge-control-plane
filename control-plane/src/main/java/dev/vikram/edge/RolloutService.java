@@ -5,6 +5,9 @@ import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -224,7 +227,7 @@ public class RolloutService {
 
   private long push(String group, Map<String, String> routes) {
     long v = version.incrementAndGet();
-    xds.push(group, EdgeConfig.snapshot(props.backends(), routes, Long.toString(v)));
+    xds.push(group, EdgeConfig.snapshot(props.backends(), routes, tlsCert(), Long.toString(v)));
     if (CANARY.equals(group)) {
       canaryRoutes.set(routes);
     }
@@ -232,6 +235,33 @@ public class RolloutService {
   }
 
   /** One rollout. {@code outcome} is in_progress, promoted or rolled_back. */
+  /**
+   * Reads the certificate on every push, so a rotated certificate (for example an updated
+   * Kubernetes Secret) reaches Envoy with the next push. Missing files mean HTTP only.
+   */
+  Optional<EdgeConfig.TlsCert> tlsCert() {
+    if (props.tlsCertFile() == null || props.tlsKeyFile() == null) {
+      return Optional.empty();
+    }
+    Path cert = Path.of(props.tlsCertFile());
+    Path key = Path.of(props.tlsKeyFile());
+    if (!Files.isReadable(cert) || !Files.isReadable(key)) {
+      if (!tlsWarned) {
+        log.warn("No certificate at {} / {}; serving HTTP only", cert, key);
+        tlsWarned = true;
+      }
+      return Optional.empty();
+    }
+    try {
+      return Optional.of(new EdgeConfig.TlsCert(Files.readString(cert), Files.readString(key)));
+    } catch (IOException e) {
+      log.warn("Could not read the certificate; serving HTTP only", e);
+      return Optional.empty();
+    }
+  }
+
+  private volatile boolean tlsWarned;
+
   public record RolloutRecord(
       long version,
       Instant finishedAt,

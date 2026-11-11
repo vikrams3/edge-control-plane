@@ -39,4 +39,29 @@ class EdgeConfigTest {
     assertThat(log.getLogFormat().getJsonFormat().getFieldsMap())
         .containsKeys("status", "flags", "backend", "duration_ms", "authority");
   }
+
+  @Test
+  void certificateAddsAnHttpsListenerThatFetchesItOverSds() throws Exception {
+    var cert = new EdgeConfig.TlsCert("CERT PEM", "KEY PEM");
+    var snap = EdgeConfig.snapshot(Map.of("sales", "sales:8080"), Map.of("a.local", "sales"),
+        java.util.Optional.of(cert), "1");
+    assertThat(snap.listeners().resources()).containsKeys(
+        EdgeConfig.LISTENER_NAME, EdgeConfig.TLS_LISTENER_NAME);
+    assertThat(snap.secrets().resources()).containsOnlyKeys(EdgeConfig.CERT_SECRET_NAME);
+
+    var tls = snap.listeners().resources().get(EdgeConfig.TLS_LISTENER_NAME)
+        .getFilterChains(0).getTransportSocket().getTypedConfig()
+        .unpack(io.envoyproxy.envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext.class);
+    var sds = tls.getCommonTlsContext().getTlsCertificateSdsSecretConfigs(0);
+    assertThat(sds.getName()).isEqualTo(EdgeConfig.CERT_SECRET_NAME);
+    assertThat(sds.getSdsConfig().hasAds()).isTrue();
+    assertThat(cert.toString()).doesNotContain("KEY PEM");
+  }
+
+  @Test
+  void withoutCertificateThereIsOnlyHttp() {
+    var snap = EdgeConfig.snapshot(Map.of("sales", "sales:8080"), Map.of("a.local", "sales"), "1");
+    assertThat(snap.listeners().resources()).containsOnlyKeys(EdgeConfig.LISTENER_NAME);
+    assertThat(snap.secrets().resources()).isEmpty();
+  }
 }
