@@ -41,14 +41,10 @@ JAR=$(mktemp); trap 'rm -f "$JAR"' EXIT
 CRUMB=$(curl -s -c "$JAR" -u admin:admin "$J/crumbIssuer/api/json" \
   | python3 -c 'import json,sys; c=json.load(sys.stdin); print(c["crumbRequestField"]+":"+c["crumb"])')
 NEXT=$(curl -s -u admin:admin "$J/job/edge-control-plane/api/json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["nextBuildNumber"])')
-if [ "${SIMULATE_SMOKE_FAILURE:-0}" = 1 ]; then
-  curl -sf -b "$JAR" -u admin:admin -H "$CRUMB" -X POST \
-    "$J/job/edge-control-plane/buildWithParameters?SIMULATE_SMOKE_FAILURE=true" >/dev/null
-else
-  # buildWithParameters also works before the job has seen its parameters (first build)
-  curl -sf -b "$JAR" -u admin:admin -H "$CRUMB" -X POST "$J/job/edge-control-plane/buildWithParameters" >/dev/null \
-    || curl -sf -b "$JAR" -u admin:admin -H "$CRUMB" -X POST "$J/job/edge-control-plane/build" >/dev/null
-fi
+SIMULATE=false; [ "${SIMULATE_SMOKE_FAILURE:-0}" = 1 ] && SIMULATE=true
+curl -sf -b "$JAR" -u admin:admin -H "$CRUMB" -X POST \
+  "$J/job/edge-control-plane/buildWithParameters?SIMULATE_SMOKE_FAILURE=$SIMULATE" >/dev/null \
+  || { echo "Could not start the build (is the job parameterised? see jenkins/casc.yaml)"; exit 1; }
 until curl -sf -u admin:admin "$J/job/edge-control-plane/$NEXT/api/json" >/dev/null; do sleep 2; done
 while [ "$(curl -s -u admin:admin "$J/job/edge-control-plane/$NEXT/api/json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["building"])')" = True ]; do sleep 5; done
 curl -s -u admin:admin "$J/job/edge-control-plane/$NEXT/consoleText" \

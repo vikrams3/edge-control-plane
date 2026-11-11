@@ -16,6 +16,12 @@ jobs:
 - script: >
     pipelineJob('edge-control-plane') {
       description('Build, unit test, integration test (real Envoy + Postgres), deploy to kind, smoke test')
+      // Declared here, not only in the Jenkinsfile: this job is re-created from code on every
+      // Jenkins start, which would otherwise drop parameters a previous build registered.
+      parameters {
+        booleanParam('SIMULATE_SMOKE_FAILURE', false,
+            'Fail the smoke test on purpose, to exercise the automatic rollback')
+      }
       definition {
         cpsScm {
           scm {
