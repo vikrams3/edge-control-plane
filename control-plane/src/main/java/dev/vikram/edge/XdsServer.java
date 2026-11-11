@@ -4,7 +4,10 @@ import io.envoyproxy.controlplane.cache.v3.SimpleCache;
 import io.envoyproxy.controlplane.cache.v3.Snapshot;
 import io.envoyproxy.controlplane.server.V3DiscoveryServer;
 import io.grpc.Server;
+import io.grpc.netty.GrpcSslContexts;
 import io.grpc.netty.NettyServerBuilder;
+import io.netty.handler.ssl.ClientAuth;
+import java.io.File;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import java.io.IOException;
@@ -25,21 +28,35 @@ public class XdsServer {
   private final SimpleCache<String> cache = new SimpleCache<>(node -> node.getCluster());
   private final ConfigAckTracker acks;
   private final int port;
+  private final XdsTlsProperties tls;
   private Server server;
 
   public XdsServer(EdgeProperties props, ConfigAckTracker acks) {
+    this(props, acks, new XdsTlsProperties(null, null, null));
+  }
+
+  @org.springframework.beans.factory.annotation.Autowired
+  public XdsServer(EdgeProperties props, ConfigAckTracker acks, XdsTlsProperties tls) {
     this.port = props.xdsPort();
     this.acks = acks;
+    this.tls = tls;
   }
 
   @PostConstruct
   void start() throws IOException {
     V3DiscoveryServer xds = new V3DiscoveryServer(acks, cache);
-    server = NettyServerBuilder.forPort(port)
-        .addService(xds.getAggregatedDiscoveryServiceImpl())
-        .build()
-        .start();
-    log.info("xDS server listening on :{}", port);
+    NettyServerBuilder builder = NettyServerBuilder.forPort(port)
+        .addService(xds.getAggregatedDiscoveryServiceImpl());
+    if (tls.enabled()) {
+      // mTLS: Envoys must present a certificate signed by our CA, or the handshake fails
+      builder.sslContext(GrpcSslContexts.forServer(new File(tls.certFile()), new File(tls.keyFile()))
+          .trustManager(new File(tls.caFile()))
+          .clientAuth(ClientAuth.REQUIRE)
+          .build());
+    }
+    server = builder.build().start();
+    log.info("xDS server listening on :{} ({})", server.getPort(),
+        tls.enabled() ? "mTLS, client certificates required" : "plaintext");
   }
 
   /** Replaces the config for one group. Envoys in that group pick it up within milliseconds. */

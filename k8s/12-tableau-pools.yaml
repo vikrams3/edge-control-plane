@@ -15,7 +15,8 @@ spec:
         command: ["python", "-u", "/app/server.py"]
         env:
         - {name: NAME, value: tableau-a}
-        - {name: DELAY_MS, value: "0"}    # scripts/optimizer-demo.sh slows one pool down
+        - {name: DELAY_MS, value: "0"}      # scripts/optimizer-demo.sh slows one pool down
+        - {name: FAIL_PERCENT, value: "0"}  # ... or breaks it (BREAK=fail)
         ports: [{containerPort: 8080}]
         readinessProbe:
           tcpSocket: {port: 8080}
@@ -50,7 +51,8 @@ spec:
         command: ["python", "-u", "/app/server.py"]
         env:
         - {name: NAME, value: tableau-b}
-        - {name: DELAY_MS, value: "0"}    # scripts/optimizer-demo.sh slows one pool down
+        - {name: DELAY_MS, value: "0"}      # scripts/optimizer-demo.sh slows one pool down
+        - {name: FAIL_PERCENT, value: "0"}  # ... or breaks it (BREAK=fail)
         ports: [{containerPort: 8080}]
         readinessProbe:
           tcpSocket: {port: 8080}

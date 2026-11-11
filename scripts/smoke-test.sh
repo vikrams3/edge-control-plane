@@ -37,4 +37,7 @@ if kubectl -n edge get secret edge-tls >/dev/null 2>&1; then
   body=$(curl -sk --resolve "sales.edge.local:$TLS_PORT:127.0.0.1" "https://sales.edge.local:$TLS_PORT/")
   [ "$body" = "hello from sales" ] && ok "HTTPS on :10443" || fail "HTTPS returned: $body"
 fi
+if [ "${SIMULATE_FAILURE:-0}" = 1 ]; then
+  fail "simulated failure (SIMULATE_FAILURE=1), to exercise the pipeline's rollback"
+fi
 echo "Smoke test passed"

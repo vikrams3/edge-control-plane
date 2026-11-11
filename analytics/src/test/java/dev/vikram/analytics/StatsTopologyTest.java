@@ -81,4 +81,26 @@ class StatsTopologyTest {
         .get().extracting(AccessLog::backend).isEqualTo("-");
     assertThat(AccessLog.parse("{\"status\":200}")).isEmpty();   // no node: not ours
   }
+
+  @Test
+  void countsPerHostnameMetricsOnlyForRoutedRequests() {
+    var registry = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
+    var runner = new StreamsRunner("unused:9092", registry);
+    driver.close();
+    Properties p = new Properties();
+    p.put(StreamsConfig.APPLICATION_ID_CONFIG, "test2");
+    p.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "unused:9092");
+    driver = new TopologyTestDriver(StatsTopology.build(runner::count), p);
+    logs = driver.createInputTopic(StatsTopology.INPUT, new StringSerializer(), new StringSerializer());
+
+    logs.pipeInput(null, log("envoy-stable-1", "crm.edge.local", "billing", 503, 3), T0);
+    logs.pipeInput(null, log("envoy-stable-1", "crm.edge.local", "billing", 503, 3), T0);
+    logs.pipeInput(null, log("envoy-stable-1", "crm.edge.local", "sales", 200, 3), T0);
+    logs.pipeInput(null, log("envoy-stable-1", "random-attacker-host-123", "-", 404, 0), T0);
+
+    assertThat(registry.counter("edge.host.requests", "group", "stable", "host", "crm.edge.local",
+        "status_class", "5xx").count()).isEqualTo(2);
+    assertThat(registry.find("edge.host.requests").tag("host", "random-attacker-host-123").counter())
+        .isNull();
+  }
 }

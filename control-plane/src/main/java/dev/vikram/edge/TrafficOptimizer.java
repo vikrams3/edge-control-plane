@@ -12,7 +12,11 @@ import java.net.http.HttpResponse.BodyHandlers;
 import java.time.Duration;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -20,10 +24,19 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 /**
- * Self-optimizing traffic split. Every interval, for each pool, reads each member's p99 on the
- * stable Envoys over the last minute (from the Kafka analytics service) and moves weight toward
- * the faster member. Guardrails: bounded steps, a floor per member, a threshold before acting,
- * a minimum number of requests to trust the numbers, and no change while a rollout runs.
+ * Self-optimizing traffic split. Every interval, for each pool, reads each member's requests,
+ * 5xx and p99 on the stable Envoys over the last minute (from the Kafka analytics service) and:
+ *
+ * <ol>
+ *   <li>ejects a member returning 5xx at or above ejectErrorPercent (weight 0, at once), and
+ *       gives it the floor again after ejectionSeconds to see whether it recovered;</li>
+ *   <li>otherwise moves at most stepPercent from the slowest to the fastest member, but only
+ *       after {@code confirmations} consecutive readings propose the same move;</li>
+ *   <li>drifts back toward an even split when the members are close.</li>
+ * </ol>
+ *
+ * Errors act at once; latency waits for confirmation, because a coarse histogram bucket can make
+ * one reading look worse than it is. Never changes weights while a rollout runs.
  */
 @Component
 @ConditionalOnProperty(name = "edge.optimizer.enabled", havingValue = "true")
@@ -31,11 +44,20 @@ public class TrafficOptimizer {
 
   private static final Logger log = LoggerFactory.getLogger(TrafficOptimizer.class);
 
-  /** One member's numbers for the last minute. */
-  record MemberStats(long requests, long p99Ms) {}
+  /**
+   * One member's numbers: requests and p99 over the last minute, and requests and 5xx over the
+   * last 20 s (errors use a short window so a fresh failure is not diluted by older traffic).
+   */
+  record MemberStats(long requests, long p99Ms, long recentRequests, long recentErrors) {
+    int errorPercent() {
+      return recentRequests == 0 ? 0 : (int) (recentErrors * 100 / recentRequests);
+    }
+  }
 
-  /** What one step decided, and why. */
-  record Decision(Map<String, Integer> weights, String reason) {}
+  enum Kind { HOLD, SHIFT, REBALANCE, EJECT, READMIT }
+
+  /** What one step decided, and why. EJECT and READMIT apply at once; SHIFT and REBALANCE wait. */
+  record Decision(Map<String, Integer> weights, Kind kind, String member, String reason) {}
 
   private final OptimizerProperties props;
   private final TrafficWeights weights;
@@ -44,6 +66,14 @@ public class TrafficOptimizer {
   private final String analytics;
   private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build();
   private final ObjectMapper json = new ObjectMapper();
+  /** pool -> member -> when it was ejected (epoch ms) */
+  private final Map<String, Map<String, Long>> ejected = new ConcurrentHashMap<>();
+  /** pool -> member -> how many times in a row it was ejected (for the backoff) */
+  private final Map<String, Map<String, Integer>> ejections = new ConcurrentHashMap<>();
+  static final long MAX_EJECTION_MS = 10 * 60_000;
+  /** pool -> the weights the last reading proposed, waiting for confirmation */
+  private final Map<String, Map<String, Integer>> pending = new ConcurrentHashMap<>();
+  private final Map<String, Integer> agreeing = new ConcurrentHashMap<>();
 
   public TrafficOptimizer(OptimizerProperties props, TrafficWeights weights,
       RolloutService rollouts, MeterRegistry metrics, EdgeProperties edge) {
@@ -72,63 +102,172 @@ public class TrafficOptimizer {
       log.warn("Optimizer: analytics unavailable, holding all weights ({})", e.toString());
       return;
     }
-    props.pools().keySet().forEach(pool -> {
-      Map<String, Integer> current = weights.get(pool);
-      Decision d = decide(current, stats, props);
-      if (d.weights().equals(current)) {
-        log.info("Optimizer: {} holds {}: {}", pool, current, d.reason());
-      } else if (rollouts.applyWeights(pool, d.weights())) {
-        log.info("Optimizer: {} {} -> {}: {}", pool, current, d.weights(), d.reason());
-      } else {
-        log.info("Optimizer: {} skipped, a rollout is in progress", pool);
-      }
-    });
+    long now = System.currentTimeMillis();
+    props.pools().keySet().forEach(pool -> step(pool, stats, now));
   }
 
-  private Map<String, MemberStats> fetchStats() throws Exception {
-    long since = System.currentTimeMillis() - 60_000;
-    URI uri = URI.create(analytics + "/v1/stats?group=stable&by=backend&since=" + since);
-    JsonNode byBackend = json.readTree(http.send(
-        HttpRequest.newBuilder(uri).timeout(Duration.ofSeconds(5)).build(),
-        BodyHandlers.ofString()).body()).path("byBackend");
-    Map<String, MemberStats> out = new LinkedHashMap<>();
-    byBackend.fields().forEachRemaining(e -> out.put(e.getKey(), new MemberStats(
-        e.getValue().path("requests").asLong(), e.getValue().path("p99Ms").asLong())));
-    return out;
+  void step(String pool, Map<String, MemberStats> stats, long now) {
+    Map<String, Integer> current = weights.get(pool);
+    Map<String, Long> out = ejected.computeIfAbsent(pool, p -> new ConcurrentHashMap<>());
+    Map<String, Integer> count = ejections.computeIfAbsent(pool, p -> new ConcurrentHashMap<>());
+    // A member back in service that is healthy again starts its backoff from scratch.
+    current.forEach((m, w) -> {
+      MemberStats s = stats.get(m);
+      if (w > 0 && !out.containsKey(m) && s != null && s.requests() >= props.minRequests()
+          && s.errorPercent() < props.ejectErrorPercent()) {
+        count.remove(m);
+      }
+    });
+    Decision d = decide(current, stats, props, out, count, now);
+    switch (d.kind()) {
+      case HOLD -> {
+        pending.remove(pool);
+        log.info("Optimizer: {} holds {}: {}", pool, sorted(current), d.reason());
+      }
+      case EJECT, READMIT -> {
+        if (apply(pool, current, d)) {
+          pending.remove(pool);
+          if (d.kind() == Kind.EJECT) {
+            out.put(d.member(), now);
+            count.merge(d.member(), 1, Integer::sum);
+          } else {
+            out.remove(d.member());
+          }
+        }
+      }
+      case SHIFT, REBALANCE -> {
+        int seen = d.weights().equals(pending.get(pool)) ? agreeing.getOrDefault(pool, 1) + 1 : 1;
+        if (seen >= props.confirmations()) {
+          if (apply(pool, current, d)) {
+            pending.remove(pool);
+          }
+        } else {
+          pending.put(pool, d.weights());
+          agreeing.put(pool, seen);
+          log.info("Optimizer: {} reading {} of {} proposes {}: {}", pool, seen,
+              props.confirmations(), sorted(d.weights()), d.reason());
+        }
+      }
+    }
+  }
+
+  private boolean apply(String pool, Map<String, Integer> current, Decision d) {
+    if (!rollouts.applyWeights(pool, d.weights())) {
+      log.info("Optimizer: {} skipped, a rollout is in progress", pool);
+      return false;
+    }
+    log.info("Optimizer: {} {} -> {}: {}", pool, sorted(current), sorted(d.weights()), d.reason());
+    return true;
   }
 
   /**
-   * The next weights for one pool. Pure function of its inputs, so it is unit-tested directly.
-   * Moves at most stepPercent from the slowest to the fastest member when the slowest p99 is
-   * more than thresholdPercent worse; otherwise drifts back toward an even split.
+   * Latency over the last minute (p99 needs many samples), errors over the last 20 s: a fresh
+   * failure is diluted by a minute of healthy history, and errors should act fast.
+   */
+  private Map<String, MemberStats> fetchStats() throws Exception {
+    long now = System.currentTimeMillis();
+    JsonNode minute = byBackend(now - 60_000);
+    JsonNode recent = byBackend(now - ERROR_WINDOW_MS);
+    Map<String, MemberStats> out = new LinkedHashMap<>();
+    minute.fields().forEachRemaining(e -> {
+      JsonNode r = recent.path(e.getKey());
+      out.put(e.getKey(), new MemberStats(
+          e.getValue().path("requests").asLong(), e.getValue().path("p99Ms").asLong(),
+          r.path("requests").asLong(), r.path("errors5xx").asLong()));
+    });
+    return out;
+  }
+
+  static final long ERROR_WINDOW_MS = 20_000;
+
+  private JsonNode byBackend(long since) throws Exception {
+    URI uri = URI.create(analytics + "/v1/stats?group=stable&by=backend&since=" + since);
+    return json.readTree(http.send(HttpRequest.newBuilder(uri).timeout(Duration.ofSeconds(5)).build(),
+        BodyHandlers.ofString()).body()).path("byBackend");
+  }
+
+  /**
+   * The next weights for one pool. A pure function of its inputs, so it is unit-tested directly.
+   *
+   * @param ejectedSince members currently ejected, and since when (epoch ms)
    */
   static Decision decide(Map<String, Integer> current, Map<String, MemberStats> stats,
-      OptimizerProperties p) {
+      OptimizerProperties p, Map<String, Long> ejectedSince, long now) {
+    return decide(current, stats, p, ejectedSince, Map.of(), now);
+  }
+
+  /** How long the member stays out after its n-th ejection in a row: base, 2x, 4x... capped. */
+  static long ejectionMs(OptimizerProperties p, int ejectionsInARow) {
+    long ms = p.ejectionSeconds() * 1000L << Math.min(Math.max(ejectionsInARow - 1, 0), 10);
+    return Math.min(ms, Math.max(MAX_EJECTION_MS, p.ejectionSeconds() * 1000L));
+  }
+
+  /** @param ejectionsInARow per member, how many times in a row it was ejected */
+  static Decision decide(Map<String, Integer> current, Map<String, MemberStats> stats,
+      OptimizerProperties p, Map<String, Long> ejectedSince, Map<String, Integer> ejectionsInARow,
+      long now) {
+    MemberStats none = new MemberStats(0, 0, 0, 0);
+
+    // 1. An ejected member whose time is up gets the floor back, to show whether it recovered.
     for (String m : current.keySet()) {
-      MemberStats s = stats.get(m);
-      if (s == null || s.requests() < p.minRequests()) {
-        return new Decision(current, m + " has " + (s == null ? 0 : s.requests())
+      long out = ejectionMs(p, ejectionsInARow.getOrDefault(m, 1));
+      if (current.get(m) == 0 && now - ejectedSince.getOrDefault(m, 0L) >= out) {
+        String donor = largest(current);
+        return new Decision(shift(current, donor, m, p.minWeightPercent()), Kind.READMIT, m,
+            m + " was ejected " + out / 1000 + " s ago; giving it "
+                + p.minWeightPercent() + "% to see whether it recovered");
+      }
+    }
+
+    List<String> active = current.keySet().stream().filter(m -> current.get(m) > 0).toList();
+
+    // 2. Errors act at once: eject a failing member, unless it is the last one serving.
+    for (String m : active) {
+      MemberStats s = stats.getOrDefault(m, none);
+      if (s.recentRequests() >= p.minRequests() / 2 && s.errorPercent() >= p.ejectErrorPercent()) {
+        String best = active.stream().filter(o -> !o.equals(m))
+            .filter(o -> stats.getOrDefault(o, none).errorPercent() < p.ejectErrorPercent())
+            .min(Comparator.comparingInt((String o) -> stats.getOrDefault(o, none).errorPercent())
+                .thenComparingLong(o -> stats.getOrDefault(o, none).p99Ms()))
+            .orElse(null);
+        if (best == null) {
+          return new Decision(current, Kind.HOLD, m, m + " returns " + s.errorPercent()
+              + "% 5xx, but no healthy member is left to take its traffic");
+        }
+        return new Decision(shift(current, m, best, current.get(m)), Kind.EJECT, m,
+            m + " returns " + s.errorPercent() + "% 5xx in the last 20 s (" + s.recentErrors()
+                + " of " + s.recentRequests() + "); ejecting it, its traffic goes to " + best);
+      }
+    }
+
+    // 3. Latency, among the members that serve traffic, with enough requests to judge.
+    if (active.size() < 2) {
+      return new Decision(current, Kind.HOLD, null, "only one member is serving traffic");
+    }
+    for (String m : active) {
+      long r = stats.getOrDefault(m, none).requests();
+      if (r < p.minRequests()) {
+        return new Decision(current, Kind.HOLD, m, m + " has " + r
             + " requests in the last minute, fewer than " + p.minRequests() + "; not enough to judge");
       }
     }
-    String fast = current.keySet().stream()
-        .min(Comparator.comparingLong(m -> stats.get(m).p99Ms())).orElseThrow();
-    String slow = current.keySet().stream()
-        .max(Comparator.comparingLong(m -> stats.get(m).p99Ms())).orElseThrow();
-    long fastP99 = stats.get(fast).p99Ms();
-    long slowP99 = stats.get(slow).p99Ms();
-    String numbers = "p99 " + new java.util.TreeMap<>(current).keySet().stream()
-        .map(m -> m + "=" + stats.get(m).p99Ms() + "ms")
-        .collect(java.util.stream.Collectors.joining(", "));
+    String fast = active.stream().min(Comparator.comparingLong(m -> stats.get(m).p99Ms())).orElseThrow();
+    String slow = active.stream().max(Comparator.comparingLong(m -> stats.get(m).p99Ms())).orElseThrow();
+    String numbers = "p99 " + new TreeMap<>(current).keySet().stream()
+        .map(m -> m + "=" + stats.getOrDefault(m, none).p99Ms() + "ms")
+        .collect(Collectors.joining(", "));
 
-    if (slowP99 * 100 > fastP99 * (100L + p.thresholdPercent())) {
+    if (stats.get(slow).p99Ms() * 100 > stats.get(fast).p99Ms() * (100L + p.thresholdPercent())) {
       int move = Math.min(p.stepPercent(), current.get(slow) - p.minWeightPercent());
       if (move <= 0) {
-        return new Decision(current, numbers + "; " + slow + " is already at the "
+        return new Decision(current, Kind.HOLD, slow, numbers + "; " + slow + " is already at the "
             + p.minWeightPercent() + "% floor");
       }
-      return new Decision(shift(current, slow, fast, move), numbers + "; shifting " + move
-          + "% to " + fast);
+      return new Decision(shift(current, slow, fast, move), Kind.SHIFT, slow,
+          numbers + "; shifting " + move + "% to " + fast);
+    }
+    if (active.size() < current.size()) {
+      return new Decision(current, Kind.HOLD, null, numbers + "; a member is ejected, not rebalancing");
     }
     // Close enough: drift back toward an even split, one bounded step at a time.
     Map<String, Integer> even = TrafficWeights.even(current.keySet().stream().toList());
@@ -138,10 +277,15 @@ public class TrafficOptimizer {
         .min(Comparator.comparingInt(m -> current.get(m) - even.get(m))).orElseThrow();
     int move = Math.min(p.stepPercent(), current.get(over) - even.get(over));
     if (move <= 0) {
-      return new Decision(current, numbers + "; within " + p.thresholdPercent() + "%, already even");
+      return new Decision(current, Kind.HOLD, null,
+          numbers + "; within " + p.thresholdPercent() + "%, already even");
     }
-    return new Decision(shift(current, over, under, move), numbers + "; within "
-        + p.thresholdPercent() + "%, rebalancing toward even");
+    return new Decision(shift(current, over, under, move), Kind.REBALANCE, over, numbers
+        + "; within " + p.thresholdPercent() + "%, rebalancing toward even");
+  }
+
+  private static String largest(Map<String, Integer> w) {
+    return w.keySet().stream().max(Comparator.comparingInt(w::get)).orElseThrow();
   }
 
   private static Map<String, Integer> shift(Map<String, Integer> w, String from, String to, int n) {
@@ -149,5 +293,9 @@ public class TrafficOptimizer {
     next.put(from, w.get(from) - n);
     next.put(to, w.get(to) + n);
     return next;
+  }
+
+  private static Map<String, Integer> sorted(Map<String, Integer> w) {
+    return new TreeMap<>(w);
   }
 }

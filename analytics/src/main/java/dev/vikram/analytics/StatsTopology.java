@@ -37,9 +37,18 @@ public final class StatsTopology {
   private StatsTopology() {}
 
   public static Topology build() {
+    return build(log -> { });
+  }
+
+  /** @param observer sees every parsed access log (StreamsRunner counts them as metrics) */
+  public static Topology build(java.util.function.Consumer<AccessLog> observer) {
     StreamsBuilder b = new StreamsBuilder();
     b.stream(INPUT, Consumed.with(Serdes.String(), Serdes.String()))
         .flatMap((k, v) -> AccessLog.parse(v)
+            .map(log -> {
+              observer.accept(log);
+              return log;
+            })
             .map(log -> java.util.List.of(KeyValue.pair(log.key(), log)))
             .orElse(java.util.List.of()))
         .groupByKey(Grouped.with(Serdes.String(), json(AccessLog.class)))

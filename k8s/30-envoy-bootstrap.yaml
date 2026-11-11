@@ -7,6 +7,8 @@ data:
     # Bootstrap shared by every Envoy. It only says where the control plane is;
     # listeners, routes and clusters all arrive over xDS (ADS).
     # Each Envoy's group comes from --service-cluster (canary or stable).
+    # The xDS channel is mTLS: Envoy presents a client certificate signed by the xDS CA and
+    # accepts only a control plane whose certificate names control-plane.edge.svc.cluster.local.
     dynamic_resources:
       ads_config:
         api_type: GRPC
@@ -25,6 +27,21 @@ data:
           envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
             "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
             explicit_http_config: {http2_protocol_options: {}}
+        transport_socket:
+          name: envoy.transport_sockets.tls
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+            sni: control-plane.edge.svc.cluster.local
+            common_tls_context:
+              alpn_protocols: [h2]
+              tls_certificates:
+              - certificate_chain: {filename: /etc/xds-tls/client.crt}
+                private_key: {filename: /etc/xds-tls/client.key}
+              validation_context:
+                trusted_ca: {filename: /etc/xds-tls/ca.crt}
+                match_typed_subject_alt_names:
+                - san_type: DNS
+                  matcher: {exact: control-plane.edge.svc.cluster.local}
         load_assignment:
           cluster_name: xds_cluster
           endpoints:

@@ -26,6 +26,18 @@ spec:
     path: /actuator/prometheus
     interval: 15s
 ---
+# Per-hostname request counts from the Kafka analytics service (edge_host_requests_total).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata: {name: analytics, namespace: edge}
+spec:
+  selector:
+    matchLabels: {app: analytics}
+  endpoints:
+  - port: http
+    path: /actuator/prometheus
+    interval: 15s
+---
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata: {name: edge-alerts, namespace: edge}
@@ -44,6 +56,22 @@ spec:
       annotations:
         summary: "{{ $labels.group }} Envoys are returning {{ $value | humanizePercentage }} 5xx"
         runbook: "Check the last rollout (GET /v1/rollouts) and revert it with POST /v1/rollouts/{version}/revert"
+    # Per hostname, so one broken low-traffic hostname is not hidden by the healthy ones in
+    # EdgeHigh5xxRate. Needs some traffic: a hostname nobody calls cannot alert (see postmortem).
+    - alert: EdgeHostHigh5xxRate
+      expr: |
+        (
+          sum by (host) (rate(edge_host_requests_total{group="stable",status_class="5xx"}[2m]))
+            /
+          sum by (host) (rate(edge_host_requests_total{group="stable"}[2m]))
+        ) > 0.2
+        and on (host)
+        sum by (host) (increase(edge_host_requests_total{group="stable"}[2m])) >= 10
+      for: 1m
+      labels: {severity: critical}
+      annotations:
+        summary: "{{ $labels.host }} returns {{ $value | humanizePercentage }} 5xx on the stable Envoys"
+        runbook: "docs/runbook.md#edgehosthigh5xxrate-critical"
     - alert: EdgeStableEnvoysDisconnected
       expr: edge_envoys_connected{group="stable"} < 1
       for: 1m

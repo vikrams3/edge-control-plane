@@ -13,6 +13,14 @@ More than 5% of requests on a group of Envoys (`group` label: canary or stable) 
 3. **If a rollout caused it, revert it:** `curl -X POST 'localhost:8080/v1/rollouts/<last good version>/revert?wait=true'`. The revert goes through the canary. If the canary itself is broken and the revert keeps rolling back, see "Emergency" below.
 4. **If no rollout caused it, the backend is unhealthy:** `kubectl -n edge get pods`, then `kubectl -n edge describe` / `logs` the backend. Access logs show Envoy's view: `kubectl -n edge logs deploy/envoy-stable | grep '"status":5'`. The `flags` field explains a 503: `UF` = upstream connect failure, `UH` = no healthy upstream, `UT` = upstream timeout, `NR` = no route (that one is a 404).
 
+### EdgeHostHigh5xxRate (critical)
+
+One hostname returns more than 20% 5xx on the stable Envoys for 1 minute (with at least 10 requests in 2 minutes). It catches a broken hostname that is too small to move the group-wide `EdgeHigh5xxRate`. The numbers come from the access logs through Kafka, so they lag a few seconds.
+
+1. `curl -s localhost:8080/v1/routes` to see which backend the hostname points at.
+2. The same steps as `EdgeHigh5xxRate`: a recent rollout → revert it; otherwise check that backend.
+3. A hostname with no traffic cannot alert. New hostnames are covered by the canary probe instead.
+
 ### EdgeControlPlaneDown (warning)
 
 The control plane is not being scraped. **Users are not affected**: Envoy keeps serving its last config (tested: 35,846 of 35,846 requests succeeded during a 2-minute outage). What stops is route changes and automatic rollbacks.

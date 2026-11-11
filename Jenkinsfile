@@ -7,19 +7,26 @@ pipeline {
     timeout(time: 30, unit: 'MINUTES')
     disableConcurrentBuilds()
   }
+  parameters {
+    booleanParam(name: 'SIMULATE_SMOKE_FAILURE', defaultValue: false,
+        description: 'Fail the smoke test on purpose, to exercise the automatic rollback')
+  }
   environment {
-    IMAGE = "edge-control-plane"
+    // deployment name -> image; each service is built, deployed and rolled back together
+    SERVICES = "control-plane=edge-control-plane analytics=edge-analytics llm=edge-streaming"
   }
   stages {
     stage('Build and unit test') {
-      steps {
-        // The Dockerfile compiles and runs the unit tests; a failing test fails the image build.
-        sh 'docker build -t $IMAGE:$BUILD_NUMBER -t $IMAGE:dev control-plane'
+      // Each Dockerfile compiles and runs its unit tests; a failing test fails the image build.
+      parallel {
+        stage('control-plane') { steps { sh 'docker build -t edge-control-plane:$BUILD_NUMBER control-plane' } }
+        stage('analytics')     { steps { sh 'docker build -t edge-analytics:$BUILD_NUMBER analytics' } }
+        stage('streaming')     { steps { sh 'docker build -t edge-streaming:$BUILD_NUMBER streaming' } }
       }
     }
     stage('Integration test') {
       steps {
-        // Real Envoy and PostgreSQL in containers (Testcontainers)
+        // Real Envoy and PostgreSQL in containers (Testcontainers), plus the full app per probe
         sh './scripts/integration-test.sh'
       }
       post {
@@ -32,11 +39,16 @@ pipeline {
       steps {
         // A unique tag per build, so a bad deploy can be undone with "kubectl rollout undo".
         sh '''
-          kind load docker-image $IMAGE:$BUILD_NUMBER --name edge
-          kubectl -n edge set image deployment/control-plane control-plane=$IMAGE:$BUILD_NUMBER
-          kubectl -n edge annotate deployment/control-plane --overwrite \
-            kubernetes.io/change-cause="jenkins build $BUILD_NUMBER, commit $GIT_COMMIT"
-          kubectl -n edge rollout status deployment/control-plane --timeout=180s
+          for s in $SERVICES; do
+            deploy=${s%%=*}; image=${s#*=}
+            kind load docker-image $image:$BUILD_NUMBER --name edge
+            kubectl -n edge set image deployment/$deploy "*=$image:$BUILD_NUMBER"
+            kubectl -n edge annotate deployment/$deploy --overwrite \
+              kubernetes.io/change-cause="jenkins build $BUILD_NUMBER, commit $GIT_COMMIT"
+          done
+          for s in $SERVICES; do
+            kubectl -n edge rollout status deployment/${s%%=*} --timeout=240s
+          done
         '''
       }
     }
@@ -44,10 +56,17 @@ pipeline {
       steps {
         script {
           try {
-            sh './scripts/smoke-test.sh'
+            withEnv(["SIMULATE_FAILURE=${params.SIMULATE_SMOKE_FAILURE ? 1 : 0}"]) {
+              sh './scripts/smoke-test.sh'
+            }
           } catch (err) {
-            echo 'Smoke test failed: rolling the control plane back to the previous build'
-            sh 'kubectl -n edge rollout undo deployment/control-plane && kubectl -n edge rollout status deployment/control-plane --timeout=180s'
+            echo 'Smoke test failed: rolling every service back to the previous build'
+            sh '''
+              for s in $SERVICES; do kubectl -n edge rollout undo deployment/${s%%=*}; done
+              for s in $SERVICES; do kubectl -n edge rollout status deployment/${s%%=*} --timeout=240s; done
+              kubectl -n edge get deploy control-plane analytics llm \
+                -o custom-columns='DEPLOYMENT:.metadata.name,IMAGE:.spec.template.spec.containers[0].image'
+            '''
             throw err
           }
         }

@@ -7,6 +7,7 @@ data:
   server.py: |
     import hashlib
     import os
+    import random
     import time
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -19,6 +20,11 @@ data:
             h = b"tableau"
             for _ in range(20000):
                 h = hashlib.sha256(h).digest()
+            if random.random() * 100 < float(os.environ.get("FAIL_PERCENT", "0")):   # to break a pool
+                self.send_response(503)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             delay_ms = float(os.environ.get("DELAY_MS", "0"))   # to slow one pool down on purpose
             if delay_ms:
                 time.sleep(delay_ms / 1000)

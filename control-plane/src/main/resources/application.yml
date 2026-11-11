@@ -27,6 +27,10 @@ edge:
   prometheus-url: http://kps-prometheus.monitoring.svc.cluster.local:9090
   probe-window-seconds: 30    # how long the prometheus probe watches the canary
   analytics-url: http://analytics.edge.svc.cluster.local:8080   # for probe: kafka
+  xds-tls:                    # mTLS on the xDS channel; plaintext if the files are missing
+    cert-file: /etc/edge/xds-tls/server.crt
+    key-file: /etc/edge/xds-tls/server.key
+    ca-file: /etc/edge/xds-tls/ca.crt
   tls-cert-file: /etc/edge/tls/tls.crt   # HTTPS on :10443 over SDS; off if the files are missing
   tls-key-file: /etc/edge/tls/tls.key
   backends:

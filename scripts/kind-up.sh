@@ -34,8 +34,14 @@ fi
 
 echo "==> Deploying"
 kubectl apply -f k8s/00-namespace.yaml
-[ -f certs/tls.crt ] || ./scripts/gen-certs.sh
+[ -f certs/tls.crt ] && [ -f certs/xds/ca.crt ] || ./scripts/gen-certs.sh
 kubectl -n edge create secret tls edge-tls --cert=certs/tls.crt --key=certs/tls.key \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n edge create secret generic xds-server-tls --from-file=ca.crt=certs/xds/ca.crt \
+  --from-file=server.crt=certs/xds/server.crt --from-file=server.key=certs/xds/server.key \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n edge create secret generic xds-client-tls --from-file=ca.crt=certs/xds/ca.crt \
+  --from-file=client.crt=certs/xds/client.crt --from-file=client.key=certs/xds/client.key \
   --dry-run=client -o yaml | kubectl apply -f -
 kubectl apply -f k8s/
 kubectl -n edge rollout status statefulset/postgres --timeout=180s

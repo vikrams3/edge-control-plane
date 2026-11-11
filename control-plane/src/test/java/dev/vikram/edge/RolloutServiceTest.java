@@ -30,7 +30,7 @@ class RolloutServiceTest {
     XdsServer xds = new XdsServer(props, new ConfigAckTracker());
     HealthProbe probe = hosts -> new HealthProbe.ProbeResult(10, 0);   // would promote
     service = new RolloutService(xds, probe, new ErrorRatePolicy(props), props, repo, metrics,
-        new TrafficWeights(new OptimizerProperties(false, 30, 10, 10, 20, 20, null)),
+        new TrafficWeights(OptimizerProperties.of(false, 30, 10, 10, 20, 20, null)),
         BackendOptions.none());
     service.init();
   }

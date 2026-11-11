@@ -25,6 +25,7 @@ class RolloutRepositoryIT {
   static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
 
   @Autowired RolloutRepository repo;
+  @Autowired PoolWeightRepository pools;
   @Autowired JdbcTemplate jdbc;
 
   private static RolloutService.RolloutRecord rollout(long v, String outcome, Map<String, String> routes) {
@@ -35,7 +36,7 @@ class RolloutRepositoryIT {
   @Test
   void flywayCreatedTheSchema() {
     assertThat(jdbc.queryForObject(
-        "select count(*) from flyway_schema_history where success", Integer.class)).isEqualTo(1);
+        "select count(*) from flyway_schema_history where success", Integer.class)).isEqualTo(2);
   }
 
   @Test
@@ -64,5 +65,22 @@ class RolloutRepositoryIT {
   @Test
   void maxVersionIsZeroOnAnEmptyTable() {
     assertThat(repo.maxVersion()).isZero();
+  }
+
+  @Test
+  void trafficSplitSurvivesARestartUnlessThePoolChanged() {
+    var props = OptimizerProperties.of(true, 30, 10, 10, 20, 20,
+        Map.of("tableau-pool", java.util.List.of("tableau-a", "tableau-b")));
+    new TrafficWeights(props, pools).set("tableau-pool", Map.of("tableau-a", 90, "tableau-b", 10));
+
+    // "restart": a new instance reads the stored split
+    assertThat(new TrafficWeights(props, pools).get("tableau-pool"))
+        .isEqualTo(Map.of("tableau-a", 90, "tableau-b", 10));
+
+    // the pool's members changed in config: the stored split no longer fits, start even
+    var changed = OptimizerProperties.of(true, 30, 10, 10, 20, 20,
+        Map.of("tableau-pool", java.util.List.of("tableau-a", "tableau-c")));
+    assertThat(new TrafficWeights(changed, pools).get("tableau-pool"))
+        .isEqualTo(Map.of("tableau-a", 50, "tableau-c", 50));
   }
 }

@@ -3,6 +3,7 @@
 # branch, runs the integration tests, deploys to the kind cluster and smoke-tests it.
 #   ./scripts/jenkins-up.sh          # start Jenkins and run the pipeline once
 #   NO_BUILD=1 ./scripts/jenkins-up.sh
+#   SIMULATE_SMOKE_FAILURE=1 ./scripts/jenkins-up.sh   # exercise the automatic rollback
 # Jenkins builds committed code only: it clones this repo from a read-only mount.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -40,10 +41,18 @@ JAR=$(mktemp); trap 'rm -f "$JAR"' EXIT
 CRUMB=$(curl -s -c "$JAR" -u admin:admin "$J/crumbIssuer/api/json" \
   | python3 -c 'import json,sys; c=json.load(sys.stdin); print(c["crumbRequestField"]+":"+c["crumb"])')
 NEXT=$(curl -s -u admin:admin "$J/job/edge-control-plane/api/json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["nextBuildNumber"])')
-curl -sf -b "$JAR" -u admin:admin -H "$CRUMB" -X POST "$J/job/edge-control-plane/build" >/dev/null
+if [ "${SIMULATE_SMOKE_FAILURE:-0}" = 1 ]; then
+  curl -sf -b "$JAR" -u admin:admin -H "$CRUMB" -X POST \
+    "$J/job/edge-control-plane/buildWithParameters?SIMULATE_SMOKE_FAILURE=true" >/dev/null
+else
+  # buildWithParameters also works before the job has seen its parameters (first build)
+  curl -sf -b "$JAR" -u admin:admin -H "$CRUMB" -X POST "$J/job/edge-control-plane/buildWithParameters" >/dev/null \
+    || curl -sf -b "$JAR" -u admin:admin -H "$CRUMB" -X POST "$J/job/edge-control-plane/build" >/dev/null
+fi
 until curl -sf -u admin:admin "$J/job/edge-control-plane/$NEXT/api/json" >/dev/null; do sleep 2; done
 while [ "$(curl -s -u admin:admin "$J/job/edge-control-plane/$NEXT/api/json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["building"])')" = True ]; do sleep 5; done
-curl -s -u admin:admin "$J/job/edge-control-plane/$NEXT/consoleText" | grep -E '^\[Pipeline\] (stage|\{ \()|  (ok|FAIL)|Tests run:|BUILD|Finished:|is live|Smoke test' || true
+curl -s -u admin:admin "$J/job/edge-control-plane/$NEXT/consoleText" \
+  | grep -E '^\[Pipeline\] \{ \(|  (ok|FAIL)|Tests run: [0-9]+, F[^-]*$|Finished:|is live|Smoke test|rolling|DEPLOYMENT|edge-(control-plane|analytics|streaming):' || true
 RESULT=$(curl -s -u admin:admin "$J/job/edge-control-plane/$NEXT/api/json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"])')
 echo "==> Build #$NEXT: $RESULT   ($J/job/edge-control-plane/$NEXT/)"
 [ "$RESULT" = SUCCESS ]
