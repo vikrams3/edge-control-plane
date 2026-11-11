@@ -34,6 +34,8 @@ The control plane is not being scraped. **Users are not affected**: Envoy keeps 
 
 No stable Envoy is connected over ADS. They keep serving their last config. Check the Envoy logs for `gRPC config stream closed` and that the `control-plane` Service resolves (`kubectl -n edge get endpoints control-plane`).
 
+The xDS channel is mTLS, so an expired or mismatched certificate looks exactly like this. Envoy logs a TLS error (`CERTIFICATE_VERIFY_FAILED`, or the control plane refusing the handshake). Check expiry with `openssl x509 -enddate -noout -in certs/xds/server.crt` (and `client.crt`); re-issue with `./scripts/gen-certs.sh`, re-apply the `xds-server-tls` and `xds-client-tls` Secrets (`./scripts/kind-up.sh` does both), and restart the control plane and the Envoys.
+
 ## Common tasks
 
 | Task | How |
@@ -41,7 +43,7 @@ No stable Envoy is connected over ADS. They keep serving their last config. Chec
 | See what is live | `curl localhost:8080/v1/routes` and `curl localhost:8080/v1/pools` |
 | Change routes | `curl -X POST 'localhost:8080/v1/rollouts?wait=true' -H 'Content-Type: application/json' -d '{full route table}'` |
 | Roll back a change | `curl -X POST 'localhost:8080/v1/rollouts/<version>/revert?wait=true'` |
-| Drain a backend pool | Route its hostnames to another backend with a rollout. For a weighted pool, the optimizer keeps each member at 10% or more; to take one out entirely, route the hostname to the other member. |
+| Drain a backend pool | Route its hostnames to another backend with a rollout. In a weighted pool, the optimizer ejects a member returning 50% or more 5xx by itself (weight 0) and re-tests it with backoff; `curl localhost:8080/v1/pools` shows the split, and the control-plane log says why (`grep Optimizer`). To take a healthy member out for maintenance, route the hostname to the other member. |
 | Rotate the TLS certificate | Update the `edge-tls` Secret, wait for the kubelet to sync it (about 1 minute), then push (any rollout) |
 | Switch probe | `kubectl -n edge set env deploy/control-plane EDGE_PROBE=synthetic\|prometheus\|kafka` |
 | Check Envoy's live config | `kubectl -n edge port-forward deploy/envoy-stable 9901` then `localhost:9901/config_dump` |

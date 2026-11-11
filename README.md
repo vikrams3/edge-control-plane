@@ -34,6 +34,7 @@ flowchart LR
   - `kafka`: real traffic per hostname, from Envoy access logs streamed through Kafka (below). A hostname with fewer than 10 real requests in the window, such as a brand-new one, gets synthetic requests instead.
   - Every probe fails closed: no evidence counts as a failure.
 - **Observability (kind):** Prometheus scrapes every Envoy (labelled by group) and the control plane's Micrometer metrics. Grafana has an "Edge control plane" dashboard showing req/s, 5xx ratio and p99 per group and per backend, plus rollouts and connected Envoys. Alertmanager has three rules: 5xx above 5%, stable Envoys disconnected, control plane down. Every Envoy writes one JSON access-log line per request.
+- **mTLS on xDS (kind):** the control plane serves xDS over TLS and requires an Envoy client certificate signed by a private xDS CA; Envoy accepts only a control plane whose certificate names `control-plane.edge.svc.cluster.local`. A client without a certificate is refused at the handshake. Docker Compose stays plaintext for simplicity.
 - **TLS:** with a certificate in `certs/` (`./scripts/gen-certs.sh` makes a self-signed `*.edge.local` one), every Envoy also serves HTTPS on `:10443`. The certificate is not in the bootstrap: the control plane sends it as an SDS secret on the same ADS stream, and reads the files on every push, so rotating means updating the Secret and pushing. Both listeners share one route table, access log and stat prefix.
 - **State:** every rollout is a row in PostgreSQL (Spring Data JPA, schema by Flyway). On startup the control plane restores the last promoted routes and continues version numbers from the database. `POST /v1/rollouts/{version}/revert` rolls out an earlier version's routes again, through the canary like any other change.
 
@@ -46,7 +47,8 @@ flowchart LR
 | `ConfigAckTracker.java` | xDS callbacks that record which route version each Envoy ACKed or NACKed; rollouts wait on it |
 | `RolloutService.java` | Validate, canary, wait for ACK, probe, promote or roll back; one rollout at a time (`ReentrantLock`, 409 otherwise) |
 | `HealthProbe` / `SyntheticHealthProbe` / `PrometheusHealthProbe` / `KafkaHealthProbe` | Strategy for measuring canary health: synthetic requests on virtual threads, the canary's 5xx ratio from Prometheus, or per-hostname real traffic from the analytics service |
-| `TrafficOptimizer` / `TrafficWeights` / `OptimizerProperties` | Self-optimizing split of a backend pool by live p99, with guardrails |
+| `TrafficOptimizer` / `TrafficWeights` / `OptimizerProperties` | Self-optimizing split of a backend pool by live p99 and 5xx, with guardrails; the split is stored in PostgreSQL |
+| `XdsTlsProperties` | mTLS for the xDS gRPC channel |
 | `BackendOptions` | Per-backend route options, such as no route timeout plus an idle timeout for streaming backends |
 | `streaming/` | Mock LLM backend (Spring WebFlux): server-sent events, one token per 100 ms |
 | `analytics/` | Separate Kafka Streams service: Envoy access logs to per group, hostname and backend request count, 5xx and latency histogram, in 5 s windows; `GET /v1/stats` |
@@ -103,8 +105,11 @@ Both options expose the control plane on `localhost:8080`, the stable Envoy on `
 | --- | --- |
 | `docker build ./control-plane` | 17 unit tests (the image does not build if one fails) |
 | `./scripts/integration-test.sh` | Unit tests plus 7 integration tests with Testcontainers: a real Envoy ACKs our config, routes by hostname, and NACKs an invalid route while it keeps serving the last good one; a real PostgreSQL with the Flyway schema |
+| `./scripts/integration-test.sh` also runs `ApplicationWiringIT` | Starts the whole app with real PostgreSQL once per probe setting and with the optimizer on. It catches bean wiring errors (it failed with `No default constructor found` when the postmortem's fix was removed, and caught a second instance later) |
 | `./scripts/smoke-test.sh` | Against the running kind cluster: health, promote, 400 on a typo, rollback, stable unaffected, HTTPS |
-| `./scripts/jenkins-up.sh` | Local Jenkins at `localhost:8090` (admin/admin), configured as code. The `Jenkinsfile` builds committed `main`, runs the integration tests, deploys a per-build image tag to kind, smoke-tests it, and runs `kubectl rollout undo` if the smoke test fails |
+| `./scripts/jenkins-up.sh` | Local Jenkins at `localhost:8090` (admin/admin), configured as code. The `Jenkinsfile` builds committed `main` (all three services, in parallel, each running its unit tests), runs the integration tests, deploys per-build image tags to kind, smoke-tests them, and runs `kubectl rollout undo` on all three if the smoke test fails. `SIMULATE_SMOKE_FAILURE=1 ./scripts/jenkins-up.sh` exercises that rollback |
+
+Tested both ways: build #2 deployed all three services as `:2` and passed the smoke test; build #3 with `SIMULATE_SMOKE_FAILURE` deployed `:3`, failed the smoke test on purpose, and `rollout undo` put all three back on `:2`.
 
 Jenkins starts sibling containers on the host's Docker (image builds, Maven, Testcontainers), so the workspace is mounted at the same path inside Jenkins as on the host. Otherwise the bind mounts would point at paths that only exist inside the Jenkins container.
 
@@ -150,11 +155,12 @@ Kafka: too little real traffic for [pay.edge.local]; synthetic probe: 25 of 25 f
 
 `tableau.edge.local` can be routed to `tableau-pool`, which Envoy splits across `tableau-a` and `tableau-b` with `weighted_clusters`. Every 30 s, `TrafficOptimizer` reads each member's p99 on stable over the last minute, from the Kafka analytics, and moves weight toward the faster one. Guardrails:
 
-- At most 10 points per step.
-- Each member keeps at least 10% of traffic.
+- At most 10 points per step, and only after **two consecutive readings** propose the same move (one noisy reading moved traffic in an early version).
+- Each member keeps at least 10% of traffic, so a slower one stays measured.
 - It acts only on a p99 more than 20% worse, and only with at least 20 requests per member.
+- **A failing member is ejected at once** (5xx at or above 50% over the last 20 s): weight 0, below the floor. It is re-tested with 10% after 60 s, doubling to 120 s, 240 s… up to 10 minutes while it stays broken, like Envoy's outlier detection. Errors act immediately; latency waits for confirmation.
 - When the members are equal again, it drifts back to even.
-- It never changes weights while a rollout is running.
+- It never changes weights while a rollout is running, and the split survives a control plane restart (PostgreSQL).
 
 `./scripts/optimizer-demo.sh` slows `tableau-b` by 300 ms, then heals it:
 
@@ -164,7 +170,16 @@ Kafka: too little real traffic for [pay.edge.local]; synthetic probe: 25 of 25 f
 | `tableau-b` +300 ms | 60/40 → 70/30 → 80/20 → 90/10 over 2 min, then holds at the floor | 500 ms |
 | `tableau-b` healed | back to 50 / 50 over the next 3 min | 50 ms |
 
-The honest result: the share of slow requests fell from 50% to 10%, but p99 did not improve, because 10% is far above 1%. The floor keeps the slow pool measured, so it can win traffic back, and that costs the tail. For a member that is clearly broken, Envoy outlier detection (eject it) is the better tool; the optimizer is for gradual shifts. One early step was also caused by noise (a coarse histogram bucket made 100 ms vs 50 ms look real), and reversed one step later. Requiring two agreeing readings before acting would remove that.
+With `BREAK=fail`, `tableau-b` returns 503 for every request instead:
+
+| Phase | Result |
+| --- | --- |
+| `tableau-b` breaks | Ejected (100/0) within about 60 s; about 250 requests failed in that time |
+| Control plane restarted mid-failure | Split before and after: 100/0, read back from PostgreSQL |
+| Still broken | Re-tested after 60 s, then 120 s: each re-test costs about 50 failed requests, and they get rarer |
+| Healed | Re-admitted at the next re-test. The backoff is the cost here: one re-test landed a second before the fix, so it was ejected a third time and waited 240 s. Active health checks (re-admit when a check passes, not by risking user traffic) are the next step |
+
+The honest result of the latency demo: the share of slow requests fell from 50% to 10%, but p99 did not improve, because 10% is far above 1%. The floor keeps the slow pool measured, so it can win traffic back, and that costs the tail. For a member that is clearly broken, Envoy outlier detection (eject it) is the better tool; the optimizer is for gradual shifts. One early step was also caused by noise (a coarse histogram bucket made 100 ms vs 50 ms look real), and reversed one step later. Requiring two agreeing readings before acting would remove that.
 
 ## Long-lived streaming, LLM-style (kind)
 
@@ -187,7 +202,7 @@ The `users` Deployment sends about 14 req/s to the `edge` Service, which spreads
 | Add `shop.edge.local -> tableau` | 137 | 0 | promoted | 40 s |
 | Move `crm.edge.local` to `billing` (down) | 107 | 40 (37%) | rolled back | 40 s |
 
-The trade-off: the synthetic probe finds a bad change before any user sees it, but only with fake requests. The real-traffic probe uses true signals, but a third of users hit the bad route for 40 seconds. Many teams run both, in that order. Scaling `sales` to zero fired `EdgeHigh5xxRate` in Alertmanager about 95 s later: 2-minute rate window plus 1 minute `for:`.
+The trade-off: the synthetic probe finds a bad change before any user sees it, but only with fake requests. The real-traffic probe uses true signals, but a third of users hit the bad route for 40 seconds. Many teams run both, in that order. Scaling `sales` to zero fired `EdgeHigh5xxRate` in Alertmanager about 95 s later: 2-minute rate window plus 1 minute `for:`. `EdgeHostHigh5xxRate` alerts per hostname, from `edge_host_requests_total`, which the analytics service exports from the access logs (Envoy's stats are per cluster, not per hostname). Only routed requests are counted, because the Host header is client-controlled and counting every value would create unbounded metric series. Breaking `sales` fired it after 106 s for exactly `crm.edge.local` and `sales.edge.local`. A hostname nobody calls cannot alert; new hostnames are covered by the canary probe instead.
 
 ## Control plane outage (kind)
 
@@ -259,7 +274,7 @@ CloudFront, Cloud CDN, Cloudflare and Akamai solve a different, bigger problem: 
 
 1. **Operate it like production:** GKE.
 2. **Multi-cloud:** cross-cloud failover from GKE to AWS by Envoy locality priority with active health checks.
-3. **Hardening:** outlier detection for clearly broken pool members, two agreeing readings before the optimizer acts, a Spring context test per probe setting, per-hostname 5xx alerts, mTLS on the xDS channel.
+3. **Hardening:** active health checks to re-admit an ejected pool member without risking user traffic; persist ejection state across restarts (today a restart re-tests an ejected member at once); mTLS on xDS in Docker Compose too.
 
 ## License
 
