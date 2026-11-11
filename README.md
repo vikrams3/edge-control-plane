@@ -49,8 +49,9 @@ docker compose down
 
 ```bash
 brew install kind kubectl
-./scripts/kind-up.sh        # create cluster, build, deploy, port-forward
+./scripts/kind-up.sh        # create cluster, build, deploy, metrics-server, port-forward
 ./scripts/demo.sh
+./scripts/loadtest.sh       # optional: 4 minutes of load, watch the HPA scale tableau
 kind delete cluster --name edge
 ```
 
@@ -72,10 +73,24 @@ sales.edge.local on stable is still fine -> hello from sales
 
 A second rollout started while one is running gets `409 Conflict`.
 
+## Auto-scaling under load (kind)
+
+On Kubernetes, `tableau` burns about 8 ms of CPU per request (limit 500m) and has an HPA targeting 50% CPU, from 1 to 8 pods. `scripts/loadtest.sh` runs [hey](https://github.com/rakyll/hey) inside the cluster, through the stable Envoy, at 50 concurrent connections for four 60-second rounds:
+
+| Minute | Ready pods | Requests/s | p50 (ms) | p99 (ms) | Failed |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 1 | 58 | 627 | 3774 | 8 |
+| 2 | 5 | 254 | 81 | 1370 | 0 |
+| 3 | 8 | 339 | 50 | 1278 | 0 |
+| 4 | 8 | 294 | 50 | 1422 | 0 |
+
+Scaling out gave 5.8x the throughput and cut median latency by 12x, all on one laptop with 8 CPUs. The p99 stays above 1 s because the HPA hit its 8-pod maximum while CPU was still about 150% of target, and each pod is throttled at its 500m limit. Next steps: raise `maxReplicas`, and tune the CPU limit.
+
 ## What I learned
 
 - **The data plane survives the control plane.** With the control plane stopped, Envoy keeps serving its last config. Separating the two is what makes the control plane safe to deploy.
 - **Control plane state has to be durable.** When the control plane restarts, it pushes its initial routes again, so any promoted change is lost (Envoy picked up the reset routes about 15 s later, after its reconnect backoff). Next step: store every route version in PostgreSQL and restore the last promoted one on startup.
+- **The canary caught a real capacity bug.** The first CPU-heavy tableau used Python's default listen backlog of 5. The probe sends 25 requests per host at once, so connections were reset: Envoy showed 33 `upstream_cx_connect_fail` and 33 `503`s, and even a good change rolled back. Raising the backlog and enabling keep-alive fixed it. The rollback was correct, because users would have seen those errors too.
 - **A synthetic probe is a blunt instrument.** It only tests the hostnames in the change and only `GET /`. Real traffic metrics from Envoy (Prometheus) are the better signal.
 
 ## Roadmap

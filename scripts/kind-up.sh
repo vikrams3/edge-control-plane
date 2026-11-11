@@ -14,8 +14,20 @@ fi
 echo "==> Building control plane image (compiles and runs unit tests inside Docker)"
 docker build -t edge-control-plane:dev ./control-plane
 
-echo "==> Loading image into kind"
-kind load docker-image edge-control-plane:dev --name "$CLUSTER"
+echo "==> Building the in-cluster load generator (hey)"
+docker build -q -t edge-hey:dev ./loadtest
+
+echo "==> Loading images into kind"
+kind load docker-image edge-control-plane:dev edge-hey:dev --name "$CLUSTER"
+
+echo "==> Installing metrics-server (the tableau HPA scales on CPU)"
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml
+# kind's kubelets use self-signed certs; patch once so re-runs don't stack the flag
+if ! kubectl -n kube-system get deployment metrics-server -o jsonpath='{.spec.template.spec.containers[0].args}' \
+    | grep -q kubelet-insecure-tls; then
+  kubectl -n kube-system patch deployment metrics-server --type=json \
+    -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+fi
 
 echo "==> Deploying"
 kubectl apply -f k8s/00-namespace.yaml
