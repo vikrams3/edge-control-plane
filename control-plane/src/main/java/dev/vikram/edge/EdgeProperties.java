@@ -12,7 +12,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * @param initialRoutes hostname to backend, pushed to both groups at startup
  * @param probeRequestsPerHost requests the probe sends through the canary for each hostname
  * @param maxErrorRate highest canary error rate that still promotes, for example 0.05
- * @param settleMillis how long to wait after pushing to the canary before probing
+ * @param ackTimeoutMillis how long to wait for every canary Envoy to ACK a new version
  */
 @ConfigurationProperties(prefix = "edge")
 public record EdgeProperties(
@@ -22,4 +22,4 @@ public record EdgeProperties(
     Map<String, String> initialRoutes,
     int probeRequestsPerHost,
     double maxErrorRate,
-    long settleMillis) {}
+    long ackTimeoutMillis) {}

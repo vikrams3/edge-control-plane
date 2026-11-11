@@ -20,7 +20,8 @@ spec:
           value: >-
             {"edge": {"canary-url": "http://envoy-canary.edge.svc.cluster.local:10000/",
                       "backends": {"tableau": "tableau.edge.svc.cluster.local:8080",
-                                   "sales": "sales.edge.svc.cluster.local:8080"}}}
+                                   "sales": "sales.edge.svc.cluster.local:8080",
+                                   "billing": "billing.edge.svc.cluster.local:8080"}}}
         readinessProbe:
           httpGet: {path: /actuator/health, port: 8080}
           initialDelaySeconds: 5

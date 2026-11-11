@@ -12,10 +12,11 @@ edge:
   canary-url: http://envoy-canary:10000/
   probe-requests-per-host: 25
   max-error-rate: 0.05
-  settle-millis: 2000
+  ack-timeout-millis: 5000
   backends:
     tableau: tableau:8080
     sales: sales:8080
+    billing: billing:8080     # deliberately has no running instances: the demo's "backend is down"
   initial-routes:
     "[tableau.edge.local]": tableau
     "[sales.edge.local]": sales

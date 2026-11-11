@@ -27,3 +27,9 @@ services:
   sales:
     image: hashicorp/http-echo
     command: ["-text=hello from sales", "-listen=:8080"]
+
+  # Configured in the control plane but scaled to zero: the demo's "backend is down".
+  billing:
+    image: hashicorp/http-echo
+    command: ["-text=hello from billing", "-listen=:8080"]
+    scale: 0

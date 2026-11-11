@@ -31,12 +31,17 @@ public class RolloutController {
 
   /**
    * Starts a canary rollout of a full route table (hostname to backend).
-   * 200 with the result, 400 for an empty table, 409 if a rollout is already running.
+   * 200 with the result, 400 for an empty table or an unknown backend, 409 if a rollout is
+   * already running.
    */
   @PostMapping("/rollouts")
   public ResponseEntity<?> rollout(@RequestBody Map<String, String> routes) throws InterruptedException {
     if (routes == null || routes.isEmpty()) {
       return ResponseEntity.badRequest().body(Map.of("error", "route table must not be empty"));
+    }
+    List<String> problems = rollouts.validate(routes);
+    if (!problems.isEmpty()) {
+      return ResponseEntity.badRequest().body(Map.of("error", "invalid route table", "problems", problems));
     }
     return rollouts.rollout(routes)
         .<ResponseEntity<?>>map(ResponseEntity::ok)

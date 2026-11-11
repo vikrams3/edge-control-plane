@@ -8,6 +8,7 @@ import io.grpc.netty.NettyServerBuilder;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import java.io.IOException;
+import java.time.Duration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -22,16 +23,18 @@ public class XdsServer {
   private static final Logger log = LoggerFactory.getLogger(XdsServer.class);
 
   private final SimpleCache<String> cache = new SimpleCache<>(node -> node.getCluster());
+  private final ConfigAckTracker acks;
   private final int port;
   private Server server;
 
-  public XdsServer(EdgeProperties props) {
+  public XdsServer(EdgeProperties props, ConfigAckTracker acks) {
     this.port = props.xdsPort();
+    this.acks = acks;
   }
 
   @PostConstruct
   void start() throws IOException {
-    V3DiscoveryServer xds = new V3DiscoveryServer(cache);
+    V3DiscoveryServer xds = new V3DiscoveryServer(acks, cache);
     server = NettyServerBuilder.forPort(port)
         .addService(xds.getAggregatedDiscoveryServiceImpl())
         .build()
@@ -42,6 +45,12 @@ public class XdsServer {
   /** Replaces the config for one group. Envoys in that group pick it up within milliseconds. */
   public void push(String group, Snapshot snapshot) {
     cache.setSnapshot(group, snapshot);
+  }
+
+  /** Waits until every connected Envoy in the group has ACKed this version (or NACKed it). */
+  public ConfigAckTracker.AckStatus awaitAck(String group, long version, Duration timeout)
+      throws InterruptedException {
+    return acks.await(group, version, timeout);
   }
 
   @PreDestroy

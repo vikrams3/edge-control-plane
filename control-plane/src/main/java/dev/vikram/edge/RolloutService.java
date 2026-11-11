@@ -1,11 +1,13 @@
 package dev.vikram.edge;
 
 import jakarta.annotation.PostConstruct;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
@@ -14,8 +16,9 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 /**
- * Canary rollout: push candidate routes to the canary group only, probe it, then either
- * promote to the stable group or roll the canary back to the last known-good routes.
+ * Canary rollout: push candidate routes to the canary group only, wait until the canary Envoys
+ * ACK them, probe the canary, then either promote to the stable group or roll the canary back to
+ * the last known-good routes.
  */
 @Service
 public class RolloutService {
@@ -52,21 +55,42 @@ public class RolloutService {
     log.info("Initial routes pushed to both groups: {}", initial);
   }
 
+  /**
+   * Checks a candidate route table before anything is pushed. Returns one message per problem,
+   * empty if it is valid. Catches typos like "salez" without touching any Envoy.
+   */
+  public List<String> validate(Map<String, String> candidate) {
+    List<String> problems = new ArrayList<>();
+    candidate.forEach((host, backend) -> {
+      if (host == null || host.isBlank()) {
+        problems.add("hostname must not be blank");
+      } else if (backend == null || !props.backends().containsKey(backend)) {
+        problems.add(host + ": unknown backend '" + backend + "', expected one of "
+            + new java.util.TreeSet<>(props.backends().keySet()));
+      }
+    });
+    return problems;
+  }
+
   /** Runs one rollout. Returns empty if another rollout is already in progress. */
-  public java.util.Optional<RolloutRecord> rollout(Map<String, String> candidate) throws InterruptedException {
+  public Optional<RolloutRecord> rollout(Map<String, String> candidate) throws InterruptedException {
     if (!rolloutLock.tryLock()) {
-      return java.util.Optional.empty();
+      return Optional.empty();
     }
     try {
       Map<String, String> routes = Map.copyOf(candidate);
       long v = push(CANARY, routes);
       log.info("v{} pushed to canary: {}", v, routes);
 
-      Thread.sleep(props.settleMillis());   // let the canary Envoys apply the update
-      HealthProbe.ProbeResult result = probe.probe(routes.keySet());
+      // Wait for every canary Envoy to confirm it applied v, instead of sleeping and hoping.
+      ConfigAckTracker.AckStatus ack =
+          xds.awaitAck(CANARY, v, Duration.ofMillis(props.ackTimeoutMillis()));
+      HealthProbe.ProbeResult result = ack == ConfigAckTracker.AckStatus.ACKED
+          ? probe.probe(routes.keySet())
+          : new HealthProbe.ProbeResult(0, 0);   // nothing to probe; counts as a failure
 
       String outcome;
-      if (policy.shouldPromote(result)) {
+      if (ack == ConfigAckTracker.AckStatus.ACKED && policy.shouldPromote(result)) {
         stableRoutes.set(routes);
         push(STABLE, routes);
         outcome = "promoted";
@@ -74,13 +98,13 @@ public class RolloutService {
         push(CANARY, stableRoutes.get());   // automatic rollback
         outcome = "rolled_back";
       }
-      log.info("v{} {}: {} of {} probe requests failed ({}%)", v, outcome,
+      log.info("v{} {}: canary {}, {} of {} probe requests failed ({}%)", v, outcome, ack,
           result.failed(), result.total(), Math.round(result.errorRate() * 100));
 
       RolloutRecord record = new RolloutRecord(v, Instant.now(), routes, outcome,
-          result.total(), result.failed(), result.errorRate());
+          ack.name().toLowerCase(), result.total(), result.failed(), result.errorRate());
       history.add(record);
-      return java.util.Optional.of(record);
+      return Optional.of(record);
     } finally {
       rolloutLock.unlock();
     }
@@ -114,6 +138,7 @@ public class RolloutService {
       Instant finishedAt,
       Map<String, String> routes,
       String outcome,
+      String canaryAck,
       int probeRequests,
       int probeFailures,
       double errorRate) {}
