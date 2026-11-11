@@ -1,0 +1,35 @@
+# Envoy stable group: gets its routes from the control plane snapshot for "stable".
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: envoy-stable, namespace: edge}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: envoy-stable}}
+  template:
+    metadata: {labels: {app: envoy-stable}}
+    spec:
+      containers:
+      - name: envoy
+        image: envoyproxy/envoy:v1.31-latest
+        args: ["-c", "/etc/envoy/envoy.yaml",
+               "--service-cluster", "stable",
+               "--service-node", "$(POD_NAME)"]
+        env:
+        - name: POD_NAME
+          valueFrom: {fieldRef: {fieldPath: metadata.name}}
+        ports:
+        - {name: http, containerPort: 10000}
+        - {name: admin, containerPort: 9901}
+        volumeMounts: [{name: bootstrap, mountPath: /etc/envoy}]
+        resources:
+          requests: {cpu: 100m, memory: 64Mi}
+      volumes:
+      - name: bootstrap
+        configMap: {name: envoy-bootstrap}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: envoy-stable, namespace: edge}
+spec:
+  selector: {app: envoy-stable}
+  ports: [{name: http, port: 10000}]

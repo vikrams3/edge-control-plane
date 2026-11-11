@@ -1,0 +1,35 @@
+# Envoy canary group: gets its routes from the control plane snapshot for "canary".
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: envoy-canary, namespace: edge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: envoy-canary}}
+  template:
+    metadata: {labels: {app: envoy-canary}}
+    spec:
+      containers:
+      - name: envoy
+        image: envoyproxy/envoy:v1.31-latest
+        args: ["-c", "/etc/envoy/envoy.yaml",
+               "--service-cluster", "canary",
+               "--service-node", "$(POD_NAME)"]
+        env:
+        - name: POD_NAME
+          valueFrom: {fieldRef: {fieldPath: metadata.name}}
+        ports:
+        - {name: http, containerPort: 10000}
+        - {name: admin, containerPort: 9901}
+        volumeMounts: [{name: bootstrap, mountPath: /etc/envoy}]
+        resources:
+          requests: {cpu: 100m, memory: 64Mi}
+      volumes:
+      - name: bootstrap
+        configMap: {name: envoy-bootstrap}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: envoy-canary, namespace: edge}
+spec:
+  selector: {app: envoy-canary}
+  ports: [{name: http, port: 10000}]

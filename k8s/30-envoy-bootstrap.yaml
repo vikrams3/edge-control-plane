@@ -1,0 +1,38 @@
+# The same Envoy bootstrap as envoy/envoy.yaml, as a ConfigMap.
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: envoy-bootstrap, namespace: edge}
+data:
+  envoy.yaml: |
+    # Bootstrap shared by every Envoy. It only says where the control plane is;
+    # listeners, routes and clusters all arrive over xDS (ADS).
+    # Each Envoy's group comes from --service-cluster (canary or stable).
+    dynamic_resources:
+      ads_config:
+        api_type: GRPC
+        transport_api_version: V3
+        grpc_services:
+        - envoy_grpc: {cluster_name: xds_cluster}
+      cds_config: {ads: {}, resource_api_version: V3}
+      lds_config: {ads: {}, resource_api_version: V3}
+
+    static_resources:
+      clusters:
+      - name: xds_cluster
+        type: STRICT_DNS
+        connect_timeout: 1s
+        typed_extension_protocol_options:
+          envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+            "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+            explicit_http_config: {http2_protocol_options: {}}
+        load_assignment:
+          cluster_name: xds_cluster
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address: {address: control-plane.edge.svc.cluster.local, port_value: 18000}
+
+    admin:
+      address:
+        socket_address: {address: 0.0.0.0, port_value: 9901}

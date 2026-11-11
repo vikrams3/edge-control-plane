@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: control-plane, namespace: edge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: control-plane}}
+  template:
+    metadata: {labels: {app: control-plane}}
+    spec:
+      containers:
+      - name: control-plane
+        image: edge-control-plane:dev       # loaded into kind by scripts/kind-up.sh
+        imagePullPolicy: IfNotPresent
+        ports:
+        - {name: http, containerPort: 8080}
+        - {name: xds, containerPort: 18000}
+        env:
+        # Fully qualified Service names, so DNS works from any namespace
+        - name: SPRING_APPLICATION_JSON
+          value: >-
+            {"edge": {"canary-url": "http://envoy-canary.edge.svc.cluster.local:10000/",
+                      "backends": {"tableau": "tableau.edge.svc.cluster.local:8080",
+                                   "sales": "sales.edge.svc.cluster.local:8080"}}}
+        readinessProbe:
+          httpGet: {path: /actuator/health, port: 8080}
+          initialDelaySeconds: 5
+        resources:
+          requests: {cpu: 250m, memory: 384Mi}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: control-plane, namespace: edge}
+spec:
+  selector: {app: control-plane}
+  ports:
+  - {name: http, port: 8080}
+  - {name: xds, port: 18000}

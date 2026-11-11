@@ -1,0 +1,29 @@
+# Quick mode: the whole demo on Docker alone, no Kubernetes.
+#   docker compose up --build -d
+#   ./scripts/demo.sh
+services:
+  control-plane:
+    build: ./control-plane
+    ports: ["8080:8080"]
+
+  envoy-canary:
+    image: envoyproxy/envoy:v1.31-latest
+    command: ["-c", "/etc/envoy/envoy.yaml", "--service-cluster", "canary", "--service-node", "envoy-canary"]
+    volumes: ["./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro"]
+    ports: ["10001:10000", "9902:9901"]
+    depends_on: [control-plane]
+
+  envoy-stable:
+    image: envoyproxy/envoy:v1.31-latest
+    command: ["-c", "/etc/envoy/envoy.yaml", "--service-cluster", "stable", "--service-node", "envoy-stable"]
+    volumes: ["./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro"]
+    ports: ["10000:10000", "9901:9901"]
+    depends_on: [control-plane]
+
+  tableau:
+    image: hashicorp/http-echo
+    command: ["-text=hello from tableau", "-listen=:8080"]
+
+  sales:
+    image: hashicorp/http-echo
+    command: ["-text=hello from sales", "-listen=:8080"]

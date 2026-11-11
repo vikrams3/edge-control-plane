@@ -1,0 +1,21 @@
+server:
+  port: 8080
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+edge:
+  xds-port: 18000
+  canary-url: http://envoy-canary:10000/
+  probe-requests-per-host: 25
+  max-error-rate: 0.05
+  settle-millis: 2000
+  backends:
+    tableau: tableau:8080
+    sales: sales:8080
+  initial-routes:
+    "[tableau.edge.local]": tableau
+    "[sales.edge.local]": sales
