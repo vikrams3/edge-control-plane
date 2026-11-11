@@ -1,0 +1,29 @@
+# Mock LLM backend (streaming/): server-sent events, one token every 100 ms for ~20 s.
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: llm, namespace: edge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: llm}}
+  template:
+    metadata: {labels: {app: llm}}
+    spec:
+      containers:
+      - name: llm
+        image: edge-streaming:dev
+        imagePullPolicy: IfNotPresent
+        env:
+        - {name: JAVA_TOOL_OPTIONS, value: "-Xmx192m"}
+        ports: [{containerPort: 8080}]
+        readinessProbe:
+          httpGet: {path: /actuator/health, port: 8080}
+          initialDelaySeconds: 5
+        resources:
+          requests: {cpu: 100m, memory: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: llm, namespace: edge}
+spec:
+  selector: {app: llm}
+  ports: [{port: 8080}]

@@ -6,6 +6,8 @@ data:
   # tableau burns about 10 ms of CPU per request, so the HPA has something to react to.
   server.py: |
     import hashlib
+    import os
+    import time
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     class Handler(BaseHTTPRequestHandler):
@@ -17,7 +19,10 @@ data:
             h = b"tableau"
             for _ in range(20000):
                 h = hashlib.sha256(h).digest()
-            body = b"hello from tableau"
+            delay_ms = float(os.environ.get("DELAY_MS", "0"))   # to slow one pool down on purpose
+            if delay_ms:
+                time.sleep(delay_ms / 1000)
+            body = ("hello from " + os.environ.get("NAME", "tableau")).encode()
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()

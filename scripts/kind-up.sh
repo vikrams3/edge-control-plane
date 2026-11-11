@@ -17,8 +17,11 @@ docker build -t edge-control-plane:dev ./control-plane
 echo "==> Building the in-cluster load generator (hey)"
 docker build -q -t edge-hey:dev ./loadtest
 
+echo "==> Building the mock LLM streaming backend"
+docker build -q -t edge-streaming:dev ./streaming
+
 echo "==> Loading images into kind"
-kind load docker-image edge-control-plane:dev edge-hey:dev --name "$CLUSTER"
+kind load docker-image edge-control-plane:dev edge-hey:dev edge-streaming:dev --name "$CLUSTER"
 
 echo "==> Installing metrics-server (the tableau HPA scales on CPU)"
 kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml

@@ -46,6 +46,9 @@ flowchart LR
 | `ConfigAckTracker.java` | xDS callbacks that record which route version each Envoy ACKed or NACKed; rollouts wait on it |
 | `RolloutService.java` | Validate, canary, wait for ACK, probe, promote or roll back; one rollout at a time (`ReentrantLock`, 409 otherwise) |
 | `HealthProbe` / `SyntheticHealthProbe` / `PrometheusHealthProbe` / `KafkaHealthProbe` | Strategy for measuring canary health: synthetic requests on virtual threads, the canary's 5xx ratio from Prometheus, or per-hostname real traffic from the analytics service |
+| `TrafficOptimizer` / `TrafficWeights` / `OptimizerProperties` | Self-optimizing split of a backend pool by live p99, with guardrails |
+| `BackendOptions` | Per-backend route options, such as no route timeout plus an idle timeout for streaming backends |
+| `streaming/` | Mock LLM backend (Spring WebFlux): server-sent events, one token per 100 ms |
 | `analytics/` | Separate Kafka Streams service: Envoy access logs to per group, hostname and backend request count, 5xx and latency histogram, in 5 s windows; `GET /v1/stats` |
 | `RolloutPolicy` / `ErrorRatePolicy` | Strategy for the promote decision; today an error-rate threshold (5%) |
 | `RolloutEntity` / `RolloutRepository` | JPA entity and Spring Data repository for the `rollouts` table (routes stored as `jsonb`) |
@@ -143,6 +146,38 @@ Kafka: canary tableau.edge.local served 30 requests in 30s, 0 were 5xx, p99 200 
 Kafka: too little real traffic for [pay.edge.local]; synthetic probe: 25 of 25 failed
 ```
 
+## Self-optimizing routing (kind)
+
+`tableau.edge.local` can be routed to `tableau-pool`, which Envoy splits across `tableau-a` and `tableau-b` with `weighted_clusters`. Every 30 s, `TrafficOptimizer` reads each member's p99 on stable over the last minute, from the Kafka analytics, and moves weight toward the faster one. Guardrails:
+
+- At most 10 points per step.
+- Each member keeps at least 10% of traffic.
+- It acts only on a p99 more than 20% worse, and only with at least 20 requests per member.
+- When the members are equal again, it drifts back to even.
+- It never changes weights while a rollout is running.
+
+`./scripts/optimizer-demo.sh` slows `tableau-b` by 300 ms, then heals it:
+
+| Phase | Weights a / b | tableau p99 |
+| --- | --- | --- |
+| Both healthy | 50 / 50, holds ("within 20%") | 50 ms |
+| `tableau-b` +300 ms | 60/40 → 70/30 → 80/20 → 90/10 over 2 min, then holds at the floor | 500 ms |
+| `tableau-b` healed | back to 50 / 50 over the next 3 min | 50 ms |
+
+The honest result: the share of slow requests fell from 50% to 10%, but p99 did not improve, because 10% is far above 1%. The floor keeps the slow pool measured, so it can win traffic back, and that costs the tail. For a member that is clearly broken, Envoy outlier detection (eject it) is the better tool; the optimizer is for gradual shifts. One early step was also caused by noise (a coarse histogram bucket made 100 ms vs 50 ms look real), and reversed one step later. Requiring two agreeing readings before acting would remove that.
+
+## Long-lived streaming, LLM-style (kind)
+
+`llm.edge.local` routes to a WebFlux backend that streams a token every 100 ms for 20 s. `./scripts/stream-test.sh` opens concurrent streams through the stable Envoys:
+
+| Setup | Result |
+| --- | --- |
+| Envoy defaults | 100 of 100 streams cut at about 16 s, after 149 of 200 tokens. The client saw status 200 and no error: a silently truncated answer |
+| `backend-options: llm: {timeout: 0s, idle-timeout: 30s}` | 100 of 100 completed (20.0 s); 1,000 concurrent streams also all completed |
+| Same, with an upstream that stalls (tokens 40 s apart) | Cut at exactly 30 s by the idle timeout, so a hung backend still cannot hold a connection forever |
+
+Envoy's route timeout (15 s by default) covers the whole response, which is right for request/response APIs and wrong for streams. Streams need it off, plus an idle timeout. The synthetic probe had the same blind spot: it waited for the whole body, so every probe of a 20 s stream "timed out" and the first rollout of `llm.edge.local` was rolled back. It now judges the status line and headers, then closes the stream.
+
 ## Real-traffic canary and alerting (kind)
 
 The `users` Deployment sends about 14 req/s to the `edge` Service, which spreads requests across all three Envoys. So the canary serves a third of real traffic. With `EDGE_PROBE=prometheus`:
@@ -200,10 +235,31 @@ Getting here took three tuning runs. Each row is the steady state at the end of 
 - **TLS added two surprises.** HTTPS clients on a non-default port send `Host: sales.edge.local:10443`, which matched no virtual host, so every request returned 404 until the connection manager set `strip_any_host_port`. Also, rotation is real: after `kubectl apply` of a new Secret, the kubelet took about 55 s to update the mounted files, and the next push served the new certificate without restarting Envoy. One caveat: the private key travels inside the xDS snapshot, so in production the xDS channel itself must use mTLS, or keys should come from a local SDS agent.
 - **A synthetic probe is a blunt instrument.** It only tests the hostnames in the change and only `GET /`. Real traffic metrics from Envoy (Prometheus) are the better signal.
 
+## Compared with a managed CDN
+
+CloudFront, Cloud CDN, Cloudflare and Akamai solve a different, bigger problem: a global network of points of presence with anycast, caching, DDoS absorption, WAF and TLS close to users. This project is the layer behind that: an L7 routing tier for your own services, where the interesting part is how configuration changes safely.
+
+| | Managed CDN | This control plane + Envoy |
+| --- | --- | --- |
+| Where it runs | The provider's global edge | Your clusters, any cloud or on-prem |
+| Best at | Caching, static and cacheable content, global reach, absorbing attacks | Routing by hostname to your own backends, custom logic, internal traffic |
+| Config changes | Through the provider's API; their rollout, their safety checks | Your rollout: canary, xDS ACK, probe on your signals, automatic rollback, audit trail in your database |
+| Signals | The provider's analytics | Your own: Prometheus, access logs in Kafka, per-hostname p99 |
+| Traffic steering | Provider features (origin groups, load balancing products) | Anything you can compute: weighted pools moved by live p99, failover by Envoy priority |
+| Cost model | Per request and per GB, operations included | Compute you run, and the engineers who run it |
+
+**When I would use each:** a managed CDN in front for anything public, cacheable or attack-prone; an Envoy tier like this one behind it, or for internal and service-to-service traffic, when routing has to follow your own rules and your own signals. Many companies run both. Envoy is also the data plane inside several managed products, so the xDS model here is the same one those products use internally.
+
+## Further reading in this repo
+
+- [docs/runbook.md](docs/runbook.md): what each alert means and what to do, common tasks.
+- [docs/postmortem-2026-11-11-bad-route-promoted.md](docs/postmortem-2026-11-11-bad-route-promoted.md): a real incident from building this: a probe judged a change on other hostnames' traffic, and a route to a down backend reached stable for 93 s.
+
 ## Roadmap
 
 1. **Operate it like production:** GKE.
-2. **Self-optimizing:** the control plane shifting `weighted_clusters` toward the faster backend pool, long-lived streaming (LLM-style) load tests, cross-cloud failover from GKE to AWS by Envoy priority.
+2. **Multi-cloud:** cross-cloud failover from GKE to AWS by Envoy locality priority with active health checks.
+3. **Hardening:** outlier detection for clearly broken pool members, two agreeing readings before the optimizer acts, a Spring context test per probe setting, per-hostname 5xx alerts, mTLS on the xDS channel.
 
 ## License
 

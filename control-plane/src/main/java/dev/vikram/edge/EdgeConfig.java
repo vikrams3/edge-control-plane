@@ -27,6 +27,8 @@ import io.envoyproxy.envoy.config.route.v3.RouteAction;
 import io.envoyproxy.envoy.config.route.v3.RouteConfiguration;
 import io.envoyproxy.envoy.config.route.v3.RouteMatch;
 import io.envoyproxy.envoy.config.route.v3.VirtualHost;
+import io.envoyproxy.envoy.config.route.v3.WeightedCluster;
+import com.google.protobuf.UInt32Value;
 import io.envoyproxy.envoy.extensions.access_loggers.stream.v3.StdoutAccessLog;
 import io.envoyproxy.envoy.extensions.filters.http.router.v3.Router;
 import io.envoyproxy.envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager;
@@ -76,6 +78,22 @@ public final class EdgeConfig {
   /** Builds a complete, versioned snapshot; with a certificate it also serves HTTPS on :10443. */
   public static Snapshot snapshot(Map<String, String> backends, Map<String, String> routes,
       Optional<TlsCert> tls, String version) {
+    return snapshot(backends, routes, Map.of(), tls, version);
+  }
+
+  /**
+   * Builds a complete, versioned snapshot. {@code pools} maps a pool name to its members'
+   * weights; a hostname routed to a pool name splits its traffic by those weights.
+   */
+  public static Snapshot snapshot(Map<String, String> backends, Map<String, String> routes,
+      Map<String, Map<String, Integer>> pools, Optional<TlsCert> tls, String version) {
+    return snapshot(backends, routes, pools, BackendOptions.none(), tls, version);
+  }
+
+  /** As above, with per-backend route options such as timeouts for streaming backends. */
+  public static Snapshot snapshot(Map<String, String> backends, Map<String, String> routes,
+      Map<String, Map<String, Integer>> pools, BackendOptions options, Optional<TlsCert> tls,
+      String version) {
     List<Cluster> clusters = new TreeMap<>(backends).entrySet().stream()
         .map(e -> cluster(e.getKey(), e.getValue()))
         .toList();
@@ -85,7 +103,7 @@ public final class EdgeConfig {
         clusters,
         List.of(),                      // endpoints are inline in each cluster (STRICT_DNS)
         listeners,
-        List.of(routeTable(routes)),
+        List.of(routeTable(routes, pools, options)),
         tls.map(c -> List.of(certSecret(c))).orElse(List.of()),   // SDS
         version);
   }
@@ -127,14 +145,44 @@ public final class EdgeConfig {
 
   /** One virtual host per hostname, each sending all paths to its backend cluster. */
   static RouteConfiguration routeTable(Map<String, String> routes) {
+    return routeTable(routes, Map.of());
+  }
+
+  /** As above; a hostname routed to a pool gets weighted_clusters across the pool's members. */
+  static RouteConfiguration routeTable(Map<String, String> routes,
+      Map<String, Map<String, Integer>> pools) {
+    return routeTable(routes, pools, BackendOptions.none());
+  }
+
+  static RouteConfiguration routeTable(Map<String, String> routes,
+      Map<String, Map<String, Integer>> pools, BackendOptions options) {
     RouteConfiguration.Builder rc = RouteConfiguration.newBuilder().setName(ROUTE_CONFIG_NAME);
-    new TreeMap<>(routes).forEach((host, backend) -> rc.addVirtualHosts(
-        VirtualHost.newBuilder()
-            .setName(host)
-            .addDomains(host)
-            .addRoutes(Route.newBuilder()
-                .setMatch(RouteMatch.newBuilder().setPrefix("/"))
-                .setRoute(RouteAction.newBuilder().setCluster(backend)))));
+    new TreeMap<>(routes).forEach((host, backend) -> {
+      RouteAction.Builder action = RouteAction.newBuilder();
+      Map<String, Integer> pool = pools.get(backend);
+      if (pool == null) {
+        action.setCluster(backend);
+        BackendOptions.Options o = options.backendOptions().get(backend);
+        if (o != null && o.timeout() != null) {
+          action.setTimeout(proto(o.timeout()));          // 0 = no whole-response timeout
+        }
+        if (o != null && o.idleTimeout() != null) {
+          action.setIdleTimeout(proto(o.idleTimeout()));  // but a silent stream is still cut
+        }
+      } else {
+        WeightedCluster.Builder wc = WeightedCluster.newBuilder();
+        new TreeMap<>(pool).forEach((member, weight) -> wc.addClusters(
+            WeightedCluster.ClusterWeight.newBuilder()
+                .setName(member).setWeight(UInt32Value.of(weight))));
+        action.setWeightedClusters(wc);
+      }
+      rc.addVirtualHosts(VirtualHost.newBuilder()
+          .setName(host)
+          .addDomains(host)
+          .addRoutes(Route.newBuilder()
+              .setMatch(RouteMatch.newBuilder().setPrefix("/"))
+              .setRoute(action)));
+    });
     return rc.build();
   }
 
@@ -219,6 +267,10 @@ public final class EdgeConfig {
         .setName("envoy.access_loggers.stdout")
         .setTypedConfig(Any.pack(stdout))
         .build();
+  }
+
+  static Duration proto(java.time.Duration d) {
+    return Duration.newBuilder().setSeconds(d.getSeconds()).setNanos(d.getNano()).build();
   }
 
   static Address address(String host, int port) {

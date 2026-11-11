@@ -29,9 +29,17 @@ import org.springframework.web.bind.annotation.RestController;
 public class RolloutController {
 
   private final RolloutService rollouts;
+  private final TrafficWeights weights;
 
-  public RolloutController(RolloutService rollouts) {
+  public RolloutController(RolloutService rollouts, TrafficWeights weights) {
     this.rollouts = rollouts;
+    this.weights = weights;
+  }
+
+  @GetMapping("/pools")
+  @Operation(summary = "Current traffic split (percent) of each backend pool")
+  public Map<String, Map<String, Integer>> pools() {
+    return weights.all();
   }
 
   @GetMapping("/routes")

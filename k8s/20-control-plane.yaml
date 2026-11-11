@@ -21,7 +21,12 @@ spec:
             {"edge": {"canary-url": "http://envoy-canary.edge.svc.cluster.local:10000/",
                       "backends": {"tableau": "tableau.edge.svc.cluster.local:8080",
                                    "sales": "sales.edge.svc.cluster.local:8080",
-                                   "billing": "billing.edge.svc.cluster.local:8080"}}}
+                                   "billing": "billing.edge.svc.cluster.local:8080",
+                                   "tableau-a": "tableau-a.edge.svc.cluster.local:8080",
+                                   "tableau-b": "tableau-b.edge.svc.cluster.local:8080",
+                                   "llm": "llm.edge.svc.cluster.local:8080"},
+                      "backend-options": {"llm": {"timeout": "0s", "idle-timeout": "30s"}},
+                      "optimizer": {"enabled": true, "pools": {"tableau-pool": ["tableau-a", "tableau-b"]}}}}
         - name: SPRING_DATASOURCE_URL
           value: jdbc:postgresql://postgres.edge.svc.cluster.local:5432/edge
         - name: SPRING_DATASOURCE_USERNAME

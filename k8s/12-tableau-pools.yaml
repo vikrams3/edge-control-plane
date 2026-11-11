@@ -1,0 +1,71 @@
+# Two pools of the same tableau service: the control plane's optimizer splits
+# tableau-pool traffic between them by live p99 (see TrafficOptimizer).
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: tableau-a, namespace: edge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: tableau-a}}
+  template:
+    metadata: {labels: {app: tableau-a}}
+    spec:
+      containers:
+      - name: tableau
+        image: python:3.13-alpine
+        command: ["python", "-u", "/app/server.py"]
+        env:
+        - {name: NAME, value: tableau-a}
+        - {name: DELAY_MS, value: "0"}    # scripts/optimizer-demo.sh slows one pool down
+        ports: [{containerPort: 8080}]
+        readinessProbe:
+          tcpSocket: {port: 8080}
+          periodSeconds: 2
+        resources:
+          requests: {cpu: 50m, memory: 32Mi}
+          limits: {memory: 64Mi}
+        volumeMounts: [{name: app, mountPath: /app}]
+      volumes:
+      - name: app
+        configMap: {name: tableau-app}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: tableau-a, namespace: edge}
+spec:
+  selector: {app: tableau-a}
+  ports: [{port: 8080}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: tableau-b, namespace: edge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: tableau-b}}
+  template:
+    metadata: {labels: {app: tableau-b}}
+    spec:
+      containers:
+      - name: tableau
+        image: python:3.13-alpine
+        command: ["python", "-u", "/app/server.py"]
+        env:
+        - {name: NAME, value: tableau-b}
+        - {name: DELAY_MS, value: "0"}    # scripts/optimizer-demo.sh slows one pool down
+        ports: [{containerPort: 8080}]
+        readinessProbe:
+          tcpSocket: {port: 8080}
+          periodSeconds: 2
+        resources:
+          requests: {cpu: 50m, memory: 32Mi}
+          limits: {memory: 64Mi}
+        volumeMounts: [{name: app, mountPath: /app}]
+      volumes:
+      - name: app
+        configMap: {name: tableau-app}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: tableau-b, namespace: edge}
+spec:
+  selector: {app: tableau-b}
+  ports: [{port: 8080}]

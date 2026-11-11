@@ -17,6 +17,9 @@ import org.springframework.stereotype.Component;
 /**
  * Sends test requests through the canary Envoy, in parallel on virtual threads,
  * and counts anything that is not a 2xx as a failure.
+ *
+ * <p>It judges the status line and headers only, then closes the response: a streaming backend
+ * (LLM-style token stream) answers 200 at once but keeps the body open for tens of seconds.
  */
 @Component
 @ConditionalOnProperty(name = "edge.probe", havingValue = "synthetic", matchIfMissing = true)
@@ -63,8 +66,11 @@ public class SyntheticHealthProbe implements HealthProbe {
         .GET()
         .build();
     try {
-      int status = http.send(req, BodyHandlers.discarding()).statusCode();
-      return status >= 200 && status < 300;
+      // ofInputStream returns as soon as the headers arrive; closing it ends the stream
+      var response = http.send(req, BodyHandlers.ofInputStream());
+      try (var body = response.body()) {
+        return response.statusCode() >= 200 && response.statusCode() < 300;
+      }
     } catch (Exception e) {
       return false;
     }

@@ -29,7 +29,9 @@ class RolloutServiceTest {
     when(repo.findFirstByOutcomeOrderByVersionDesc("promoted")).thenReturn(Optional.empty());
     XdsServer xds = new XdsServer(props, new ConfigAckTracker());
     HealthProbe probe = hosts -> new HealthProbe.ProbeResult(10, 0);   // would promote
-    service = new RolloutService(xds, probe, new ErrorRatePolicy(props), props, repo, metrics);
+    service = new RolloutService(xds, probe, new ErrorRatePolicy(props), props, repo, metrics,
+        new TrafficWeights(new OptimizerProperties(false, 30, 10, 10, 20, 20, null)),
+        BackendOptions.none());
     service.init();
   }
 

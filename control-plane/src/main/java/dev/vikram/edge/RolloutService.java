@@ -48,6 +48,8 @@ public class RolloutService {
   private final EdgeProperties props;
   private final RolloutRepository repo;
   private final MeterRegistry metrics;
+  private final TrafficWeights weights;
+  private final BackendOptions options;
 
   private final AtomicLong version = new AtomicLong();
   private final AtomicReference<Map<String, String>> stableRoutes = new AtomicReference<>();
@@ -62,13 +64,16 @@ public class RolloutService {
   private final ExecutorService workers = Executors.newVirtualThreadPerTaskExecutor();
 
   public RolloutService(XdsServer xds, HealthProbe probe, RolloutPolicy policy,
-      EdgeProperties props, RolloutRepository repo, MeterRegistry metrics) {
+      EdgeProperties props, RolloutRepository repo, MeterRegistry metrics, TrafficWeights weights,
+      BackendOptions options) {
     this.xds = xds;
     this.probe = probe;
     this.policy = policy;
     this.props = props;
     this.repo = repo;
     this.metrics = metrics;
+    this.weights = weights;
+    this.options = options;
   }
 
   /**
@@ -113,9 +118,11 @@ public class RolloutService {
     candidate.forEach((host, backend) -> {
       if (host == null || host.isBlank()) {
         problems.add("hostname must not be blank");
-      } else if (backend == null || !props.backends().containsKey(backend)) {
-        problems.add(host + ": unknown backend '" + backend + "', expected one of "
-            + new TreeSet<>(props.backends().keySet()));
+      } else if (backend == null
+          || !(props.backends().containsKey(backend) || weights.isPool(backend))) {
+        Set<String> known = new TreeSet<>(props.backends().keySet());
+        known.addAll(weights.all().keySet());
+        problems.add(host + ": unknown backend '" + backend + "', expected one of " + known);
       }
     });
     return problems;
@@ -210,6 +217,25 @@ public class RolloutService {
     return changed.isEmpty() ? new TreeSet<>(candidate.keySet()) : changed;
   }
 
+  /**
+   * Applies a new traffic split for one pool to both groups. Not a route change, so it skips the
+   * canary: the optimizer bounds each step instead. Returns false (and changes nothing) while a
+   * rollout is in progress, so the two never interleave.
+   */
+  public boolean applyWeights(String pool, Map<String, Integer> next) {
+    if (!oneRollout.tryAcquire()) {
+      return false;
+    }
+    try {
+      weights.set(pool, next);
+      push(STABLE, stableRoutes.get());
+      push(CANARY, canaryRoutes.get());
+      return true;
+    } finally {
+      oneRollout.release();
+    }
+  }
+
   /** A rollout by version: still running, or from the database. */
   public Optional<RolloutRecord> find(long version) {
     RolloutRecord live = running.get(version);
@@ -242,7 +268,8 @@ public class RolloutService {
 
   private long push(String group, Map<String, String> routes) {
     long v = version.incrementAndGet();
-    xds.push(group, EdgeConfig.snapshot(props.backends(), routes, tlsCert(), Long.toString(v)));
+    xds.push(group, EdgeConfig.snapshot(props.backends(), routes, weights.all(), options,
+        tlsCert(), Long.toString(v)));
     if (CANARY.equals(group)) {
       canaryRoutes.set(routes);
     }
