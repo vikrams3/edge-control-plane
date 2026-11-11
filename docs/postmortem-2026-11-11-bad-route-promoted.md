@@ -54,5 +54,5 @@ Two things went wrong together:
 | Unit tests for both, including "no traffic" and "a removal" | Done (`ProbeSelectionTest`) |
 | `@Autowired` on the Spring constructor | Done |
 | Scripts that deploy then test must stop if the deploy fails (`set -e`, and chain `rollout status` with `&&`) | Done in `smoke-test.sh` and the Jenkinsfile; ad-hoc test commands are a habit to keep |
-| A Spring context test that starts the app with each `edge.probe` value, so bean wiring errors fail CI rather than a deploy | Open |
+| A Spring context test that starts the app with each `edge.probe` value, so bean wiring errors fail CI rather than a deploy | Done (`ApplicationWiringIT`; it fails with `No default constructor found` when the `@Autowired` is removed) |
 | Per-hostname 5xx alert, so a broken low-traffic hostname is caught even if a probe misses it | Open |
