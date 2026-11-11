@@ -10,6 +10,8 @@ data:
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"          # keep-alive, so Envoy reuses connections
+        disable_nagle_algorithm = True         # headers and body go out as separate writes; with
+                                               # Nagle + delayed ACK that stalls each reply ~40 ms
 
         def do_GET(self):
             h = b"tableau"
@@ -48,8 +50,10 @@ spec:
           tcpSocket: {port: 8080}
           periodSeconds: 2
         resources:
+          # No CPU limit: a 500m limit throttled each pod in 100 ms CFS periods, which pinned
+          # p50 at 50 ms and stretched p99. The HPA scales on the request instead.
           requests: {cpu: 200m, memory: 32Mi}
-          limits: {cpu: 500m, memory: 64Mi}
+          limits: {memory: 64Mi}
         volumeMounts: [{name: app, mountPath: /app}]
       volumes:
       - name: app

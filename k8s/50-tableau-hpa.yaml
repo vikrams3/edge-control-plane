@@ -5,7 +5,7 @@ metadata: {name: tableau, namespace: edge}
 spec:
   scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: tableau}
   minReplicas: 1
-  maxReplicas: 8
+  maxReplicas: 16
   metrics:
   - type: Resource
     resource:
