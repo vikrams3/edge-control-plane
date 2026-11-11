@@ -89,6 +89,17 @@ On kind, Grafana is at `localhost:3000` (admin/admin, dashboard "Edge control pl
 
 Both options expose the control plane on `localhost:8080`, the stable Envoy on `localhost:10000` (HTTPS `:10443`) and the canary Envoy on `localhost:10001`. Try `curl --cacert certs/tls.crt --resolve sales.edge.local:10443:127.0.0.1 https://sales.edge.local:10443/`. Envoy's admin page is useful for debugging: `localhost:9901/config_dump` in Docker mode.
 
+## Tests and CI
+
+| Command | What runs |
+| --- | --- |
+| `docker build ./control-plane` | 17 unit tests (the image does not build if one fails) |
+| `./scripts/integration-test.sh` | Unit tests plus 7 integration tests with Testcontainers: a real Envoy ACKs our config, routes by hostname, and NACKs an invalid route while it keeps serving the last good one; a real PostgreSQL with the Flyway schema |
+| `./scripts/smoke-test.sh` | Against the running kind cluster: health, promote, 400 on a typo, rollback, stable unaffected, HTTPS |
+| `./scripts/jenkins-up.sh` | Local Jenkins at `localhost:8090` (admin/admin), configured as code. The `Jenkinsfile` builds committed `main`, runs the integration tests, deploys a per-build image tag to kind, smoke-tests it, and runs `kubectl rollout undo` if the smoke test fails |
+
+Jenkins starts sibling containers on the host's Docker (image builds, Maven, Testcontainers), so the workspace is mounted at the same path inside Jenkins as on the host. Otherwise the bind mounts would point at paths that only exist inside the Jenkins container.
+
 ## Demo output
 
 ```text
@@ -157,7 +168,7 @@ Getting here took three tuning runs. Each row is the steady state at the end of 
 
 ## Roadmap
 
-1. **Operate it like production:** Testcontainers test against a real Envoy, Jenkins pipeline, GKE.
+1. **Operate it like production:** GKE.
 2. **Analytics and self-optimizing:** Envoy access logs to Kafka, a Kafka Streams job computing per-route error rate and p99, the control plane shifting `weighted_clusters` toward the faster backend pool, long-lived streaming (LLM-style) load tests, cross-cloud failover from GKE to AWS by Envoy priority.
 
 ## License
