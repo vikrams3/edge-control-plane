@@ -28,7 +28,11 @@ flowchart LR
 - **Data plane:** Envoy. Each proxy starts with a tiny bootstrap (`envoy/envoy.yaml`) that only says where the control plane is. Listeners, routes and clusters all arrive over ADS.
 - **Control plane:** Spring Boot plus [java-control-plane](https://github.com/envoyproxy/java-control-plane). It keeps one xDS snapshot per Envoy group. An Envoy's group is its `node.cluster`, set with `--service-cluster canary|stable`.
 - **Rollout:** `POST /v1/rollouts` first rejects unknown backends with `400`. It then pushes the new route table to the canary group and waits until every canary Envoy ACKs that version over xDS (up to 5 s). Next it sends 25 test requests per hostname through the canary in parallel (virtual threads), and promotes or rolls back based on the error rate. A NACK, a timeout or no connected canary means an immediate rollback, with no probe.
-- **Probes:** two `HealthProbe` strategies, chosen with `edge.probe`. `synthetic` (the default) sends 25 test requests per hostname through the canary, which is fast and needs no traffic. `prometheus` watches real user traffic on the canary for 30 s and asks Prometheus for its 5xx ratio. No traffic means no evidence, which counts as a failure.
+- **Probes:** only the hostnames a change adds or re-points are probed (all of them if nothing changed), so a broken route is not diluted by healthy ones. Three `HealthProbe` strategies, chosen with `edge.probe`:
+  - `synthetic` (the default): 25 test requests per hostname through the canary. Fast, and needs no traffic.
+  - `prometheus`: watches real user traffic on the canary for 30 s and asks Prometheus for its 5xx ratio. It only knows the canary as a whole.
+  - `kafka`: real traffic per hostname, from Envoy access logs streamed through Kafka (below). A hostname with fewer than 10 real requests in the window, such as a brand-new one, gets synthetic requests instead.
+  - Every probe fails closed: no evidence counts as a failure.
 - **Observability (kind):** Prometheus scrapes every Envoy (labelled by group) and the control plane's Micrometer metrics. Grafana has an "Edge control plane" dashboard showing req/s, 5xx ratio and p99 per group and per backend, plus rollouts and connected Envoys. Alertmanager has three rules: 5xx above 5%, stable Envoys disconnected, control plane down. Every Envoy writes one JSON access-log line per request.
 - **TLS:** with a certificate in `certs/` (`./scripts/gen-certs.sh` makes a self-signed `*.edge.local` one), every Envoy also serves HTTPS on `:10443`. The certificate is not in the bootstrap: the control plane sends it as an SDS secret on the same ADS stream, and reads the files on every push, so rotating means updating the Secret and pushing. Both listeners share one route table, access log and stat prefix.
 - **State:** every rollout is a row in PostgreSQL (Spring Data JPA, schema by Flyway). On startup the control plane restores the last promoted routes and continues version numbers from the database. `POST /v1/rollouts/{version}/revert` rolls out an earlier version's routes again, through the canary like any other change.
@@ -41,7 +45,8 @@ flowchart LR
 | `XdsServer.java` | gRPC ADS server; one snapshot per Envoy group |
 | `ConfigAckTracker.java` | xDS callbacks that record which route version each Envoy ACKed or NACKed; rollouts wait on it |
 | `RolloutService.java` | Validate, canary, wait for ACK, probe, promote or roll back; one rollout at a time (`ReentrantLock`, 409 otherwise) |
-| `HealthProbe` / `SyntheticHealthProbe` / `PrometheusHealthProbe` | Strategy for measuring canary health: synthetic requests on virtual threads, or the canary's real 5xx ratio from Prometheus |
+| `HealthProbe` / `SyntheticHealthProbe` / `PrometheusHealthProbe` / `KafkaHealthProbe` | Strategy for measuring canary health: synthetic requests on virtual threads, the canary's 5xx ratio from Prometheus, or per-hostname real traffic from the analytics service |
+| `analytics/` | Separate Kafka Streams service: Envoy access logs to per group, hostname and backend request count, 5xx and latency histogram, in 5 s windows; `GET /v1/stats` |
 | `RolloutPolicy` / `ErrorRatePolicy` | Strategy for the promote decision; today an error-rate threshold (5%) |
 | `RolloutEntity` / `RolloutRepository` | JPA entity and Spring Data repository for the `rollouts` table (routes stored as `jsonb`) |
 | `db/migration/V1__rollouts.sql` | Flyway migration that creates the schema |
@@ -78,8 +83,8 @@ docker compose down
 
 ```bash
 brew install kind kubectl
-./scripts/kind-up.sh        # cluster, build, deploy, metrics-server, Prometheus/Grafana, port-forward
-                            # (MONITORING=0 skips Prometheus/Grafana)
+./scripts/kind-up.sh        # cluster, build, deploy, metrics-server, Prometheus/Grafana, Kafka, port-forward
+                            # (MONITORING=0 / KAFKA=0 skip those parts)
 ./scripts/demo.sh
 ./scripts/loadtest.sh       # optional: 4 minutes of load, watch the HPA scale tableau
 kind delete cluster --name edge
@@ -114,13 +119,29 @@ crm.edge.local on stable -> hello from sales
 
 ==> Bad change: move crm.edge.local to billing, which is down. Expect: rolled_back
 {"version":5,"routes":{...,"crm.edge.local":"billing"},"outcome":"rolled_back","canaryAck":"acked",
- "probeRequests":75,"probeFailures":25,"errorRate":0.333}
+ "probeRequests":25,"probeFailures":25,"errorRate":1.0}
 crm.edge.local on stable is still fine -> hello from sales
 ```
 
 After a restart, `GET /v1/routes` still shows `crm.edge.local`, restored from PostgreSQL. Reverting to the bad version (`POST /v1/rollouts/5/revert`) is caught by the canary again and rolled back.
 
 `billing` is a configured backend with zero running instances, so it stands in for a service that is down. A second rollout started while one is running gets `409 Conflict`. If no canary Envoy is connected, the rollout rolls back with `"canaryAck":"no_nodes"` and sends no probes.
+
+## Real-time analytics with Kafka (kind)
+
+```text
+Envoy stdout (JSON access log) -> Fluent Bit (DaemonSet) -> Kafka topic envoy-access-logs
+  -> analytics (Kafka Streams): key group|host|backend, 5 s tumbling windows,
+     count + 5xx + latency histogram -> state store (GET /v1/stats) and topic route-stats
+```
+
+Histograms with fixed buckets can be merged, so 5-second windows sum to any range. That lets the probe ask "since the canary ACKed" instead of "the last full minute". Kafka is Strimzi 1.3 with one KRaft node, sized for a laptop. With `EDGE_PROBE=kafka`, a bad change shows exactly which hostname broke:
+
+```text
+Kafka: canary crm.edge.local served 39 requests in 30s, 39 were 5xx, p99 2000 ms
+Kafka: canary tableau.edge.local served 30 requests in 30s, 0 were 5xx, p99 200 ms
+Kafka: too little real traffic for [pay.edge.local]; synthetic probe: 25 of 25 failed
+```
 
 ## Real-traffic canary and alerting (kind)
 
@@ -182,7 +203,7 @@ Getting here took three tuning runs. Each row is the steady state at the end of 
 ## Roadmap
 
 1. **Operate it like production:** GKE.
-2. **Analytics and self-optimizing:** Envoy access logs to Kafka, a Kafka Streams job computing per-route error rate and p99, the control plane shifting `weighted_clusters` toward the faster backend pool, long-lived streaming (LLM-style) load tests, cross-cloud failover from GKE to AWS by Envoy priority.
+2. **Self-optimizing:** the control plane shifting `weighted_clusters` toward the faster backend pool, long-lived streaming (LLM-style) load tests, cross-cloud failover from GKE to AWS by Envoy priority.
 
 ## License
 

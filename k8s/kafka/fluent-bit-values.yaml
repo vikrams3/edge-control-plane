@@ -1,0 +1,39 @@
+# Fluent Bit DaemonSet: tail the Envoy containers' stdout (one JSON access log per line)
+# and produce each line to Kafka. Everything else on the node is ignored.
+resources:
+  requests: {cpu: 20m, memory: 32Mi}
+config:
+  service: |
+    [SERVICE]
+        Flush         1
+        Log_Level     info
+        Parsers_File  /fluent-bit/etc/parsers.conf
+        HTTP_Server   On
+        HTTP_Listen   0.0.0.0
+        HTTP_Port     2020
+        Health_Check  On
+  inputs: |
+    [INPUT]
+        Name              tail
+        Path              /var/log/containers/envoy-*_edge_envoy-*.log
+        multiline.parser  cri
+        Tag               envoy.*
+        Refresh_Interval  5
+        Mem_Buf_Limit     16MB
+        Skip_Long_Lines   On
+  filters: |
+    [FILTER]
+        Name          parser
+        Match         envoy.*
+        Key_Name      log
+        Parser        json
+        Reserve_Data  Off
+  outputs: |
+    [OUTPUT]
+        Name        kafka
+        Match       envoy.*
+        Brokers     edge-kafka-kafka-bootstrap.kafka.svc.cluster.local:9092
+        Topics      envoy-access-logs
+        Format      json
+        rdkafka.queue.buffering.max.ms  100
+        rdkafka.request.required.acks   1

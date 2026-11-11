@@ -23,9 +23,10 @@ edge:
   probe-requests-per-host: 25
   max-error-rate: 0.05
   ack-timeout-millis: 5000
-  probe: synthetic            # or "prometheus": canary error rate from real traffic
+  probe: synthetic            # or "prometheus" / "kafka": canary error rate from real traffic
   prometheus-url: http://kps-prometheus.monitoring.svc.cluster.local:9090
   probe-window-seconds: 30    # how long the prometheus probe watches the canary
+  analytics-url: http://analytics.edge.svc.cluster.local:8080   # for probe: kafka
   tls-cert-file: /etc/edge/tls/tls.crt   # HTTPS on :10443 over SDS; off if the files are missing
   tls-key-file: /etc/edge/tls/tls.key
   backends:

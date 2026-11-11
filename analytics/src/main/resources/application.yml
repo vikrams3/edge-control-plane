@@ -1,0 +1,9 @@
+server:
+  port: 8080
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+analytics:
+  kafka-bootstrap: edge-kafka-kafka-bootstrap.kafka.svc.cluster.local:9092

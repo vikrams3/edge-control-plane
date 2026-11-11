@@ -14,6 +14,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -163,7 +164,7 @@ public class RolloutService {
           xds.awaitAck(CANARY, v, Duration.ofMillis(props.ackTimeoutMillis()));
       ackName = ack.name().toLowerCase();
       if (ack == ConfigAckTracker.AckStatus.ACKED) {
-        result = probe.probe(routes.keySet());
+        result = probe.probe(changedHosts(stableRoutes.get(), routes));
       }   // otherwise nothing to probe; an empty result counts as a failure
       if (ack == ConfigAckTracker.AckStatus.ACKED && policy.shouldPromote(result)) {
         stableRoutes.set(routes);
@@ -193,6 +194,20 @@ public class RolloutService {
       oneRollout.release();
     }
     return record;
+  }
+
+  /**
+   * Hostnames that are new or point at a different backend than on stable: the only ones a
+   * change can break. If nothing changed (a removal, or the same table), every hostname.
+   */
+  static Set<String> changedHosts(Map<String, String> stable, Map<String, String> candidate) {
+    Set<String> changed = new TreeSet<>();
+    candidate.forEach((host, backend) -> {
+      if (!backend.equals(stable.get(host))) {
+        changed.add(host);
+      }
+    });
+    return changed.isEmpty() ? new TreeSet<>(candidate.keySet()) : changed;
   }
 
   /** A rollout by version: still running, or from the database. */

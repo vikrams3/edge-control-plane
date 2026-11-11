@@ -18,6 +18,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * @param probeWindowSeconds how long the prometheus probe watches real canary traffic
  * @param tlsCertFile PEM certificate chain for HTTPS on :10443; HTTPS is off if unset or missing
  * @param tlsKeyFile PEM private key for that certificate
+ * @param analyticsUrl base URL of the Kafka Streams analytics service, used by the kafka probe
  */
 @ConfigurationProperties(prefix = "edge")
 public record EdgeProperties(
@@ -32,4 +33,5 @@ public record EdgeProperties(
     String prometheusUrl,
     int probeWindowSeconds,
     String tlsCertFile,
-    String tlsKeyFile) {}
+    String tlsKeyFile,
+    String analyticsUrl) {}

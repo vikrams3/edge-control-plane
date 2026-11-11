@@ -47,5 +47,9 @@ if [ "${MONITORING:-1}" = 1 ]; then
   ./scripts/monitoring-up.sh      # skip with MONITORING=0
 fi
 
+if [ "${KAFKA:-1}" = 1 ]; then
+  ./scripts/kafka-up.sh           # skip with KAFKA=0
+fi
+
 echo "==> Port-forwarding (control plane :8080, stable Envoy :10000, canary Envoy :10001)"
 ./scripts/port-forward.sh

@@ -1,0 +1,30 @@
+# Kafka Streams job: per Envoy group, hostname and backend, request count, 5xx and latency
+# histogram in 5 s windows; queried by the control plane's KafkaHealthProbe and optimizer.
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: analytics, namespace: edge}
+spec:
+  replicas: 1          # one instance holds every partition's state store, so queries are local
+  selector: {matchLabels: {app: analytics}}
+  template:
+    metadata: {labels: {app: analytics}}
+    spec:
+      containers:
+      - name: analytics
+        image: edge-analytics:dev
+        imagePullPolicy: IfNotPresent
+        ports: [{name: http, containerPort: 8080}]
+        env:
+        - {name: JAVA_TOOL_OPTIONS, value: "-Xmx256m"}
+        readinessProbe:
+          httpGet: {path: /actuator/health, port: 8080}
+          initialDelaySeconds: 10
+        resources:
+          requests: {cpu: 100m, memory: 384Mi}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: analytics, namespace: edge, labels: {app: analytics}}
+spec:
+  selector: {app: analytics}
+  ports: [{name: http, port: 8080}]

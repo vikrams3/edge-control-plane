@@ -19,7 +19,7 @@ class RolloutServiceTest {
   private static final Map<String, String> ROUTES = Map.of("sales.edge.local", "sales");
 
   private final EdgeProperties props = new EdgeProperties(0, "http://x",
-      Map.of("sales", "sales:8080"), ROUTES, 1, 0.05, 300, "synthetic", "http://p", 30, null, null);
+      Map.of("sales", "sales:8080"), ROUTES, 1, 0.05, 300, "synthetic", "http://p", 30, null, null, "http://a");
   private final RolloutRepository repo = mock(RolloutRepository.class);
   private final SimpleMeterRegistry metrics = new SimpleMeterRegistry();
   private RolloutService service;

@@ -53,7 +53,7 @@ class EnvoyIT {
     }
     acks = new ConfigAckTracker();
     xds = new XdsServer(new EdgeProperties(xdsPort, "http://unused", Map.of(), Map.of(),
-        1, 0.05, 5000, "synthetic", "http://unused", 30, null, null), acks);
+        1, 0.05, 5000, "synthetic", "http://unused", 30, null, null, "http://a"), acks);
     xds.start();
     Testcontainers.exposeHostPorts(xdsPort);   // reachable from containers as host.testcontainers.internal
 

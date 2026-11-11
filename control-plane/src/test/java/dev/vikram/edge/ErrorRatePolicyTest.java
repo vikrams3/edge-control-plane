@@ -8,7 +8,7 @@ import org.junit.jupiter.api.Test;
 class ErrorRatePolicyTest {
 
   private final ErrorRatePolicy policy = new ErrorRatePolicy(
-      new EdgeProperties(18000, "http://x", Map.of(), Map.of(), 10, 0.05, 0, "synthetic", "http://p", 30, null, null));
+      new EdgeProperties(18000, "http://x", Map.of(), Map.of(), 10, 0.05, 0, "synthetic", "http://p", 30, null, null, "http://a"));
 
   @Test
   void promotesAtOrBelowThreshold() {
