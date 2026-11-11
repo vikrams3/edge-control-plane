@@ -1,0 +1,31 @@
+# Jenkins configuration as code: admin user, one executor pool, and the pipeline job.
+jenkins:
+  systemMessage: "edge-control-plane CI (local demo)"
+  numExecutors: 2
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+      - id: admin
+        password: admin          # local demo only
+  authorizationStrategy: loggedInUsersCanDoAnything
+unclassified:
+  location:
+    url: http://localhost:8090/
+jobs:
+- script: >
+    pipelineJob('edge-control-plane') {
+      description('Build, unit test, integration test (real Envoy + Postgres), deploy to kind, smoke test')
+      definition {
+        cpsScm {
+          scm {
+            git {
+              remote { url('file:///repo') }
+              branch('*/main')
+            }
+          }
+          scriptPath('Jenkinsfile')
+          lightweight(false)
+        }
+      }
+    }

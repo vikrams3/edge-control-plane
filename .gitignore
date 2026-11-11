@@ -4,3 +4,4 @@ control-plane/target/
 .vscode/
 .DS_Store
 certs/
+.ci/
