@@ -133,6 +133,19 @@ The `users` Deployment sends about 14 req/s to the `edge` Service, which spreads
 
 The trade-off: the synthetic probe finds a bad change before any user sees it, but only with fake requests. The real-traffic probe uses true signals, but a third of users hit the bad route for 40 seconds. Many teams run both, in that order. Scaling `sales` to zero fired `EdgeHigh5xxRate` in Alertmanager about 95 s later: 2-minute rate window plus 1 minute `for:`.
 
+## Control plane outage (kind)
+
+`./scripts/chaos-control-plane.sh` sends about 200 req/s through the stable Envoys for 2 minutes, and scales the control plane to zero for 60 s in the middle:
+
+| | Result |
+| --- | --- |
+| User requests | 23,926 of 23,926 returned 200; 0 errors; p99 5.8 ms |
+| Route changes during the outage | Impossible: the control plane API is unreachable |
+| After it came back | It restored the last promoted routes from PostgreSQL, and all 3 Envoys reconnected within 22 s (Envoy's reconnect backoff) |
+| Alerting (2-minute outage) | `EdgeControlPlaneDown` fired 107 s after the control plane went away: a missed scrape, the 30 s rule evaluation interval, then the rule's 1-minute `for:`. A 60 s outage recovers before it fires. Users saw 35,846 of 35,846 requests succeed in that run |
+
+The data plane does not depend on the control plane being up, only on it being right when it is up. That is why the control plane can be deployed, restarted or lose its database without an outage for users.
+
 ## Auto-scaling under load (kind)
 
 On Kubernetes, `tableau` burns about 8 ms of CPU per request (request 200m, no CPU limit) and has an HPA targeting 50% CPU, from 1 to 16 pods. `scripts/loadtest.sh` runs [hey](https://github.com/rakyll/hey) inside the cluster, through the stable Envoy, at 50 concurrent connections for four 60-second rounds:
