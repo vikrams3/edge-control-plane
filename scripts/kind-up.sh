@@ -32,6 +32,7 @@ fi
 echo "==> Deploying"
 kubectl apply -f k8s/00-namespace.yaml
 kubectl apply -f k8s/
+kubectl -n edge rollout status statefulset/postgres --timeout=180s
 kubectl -n edge rollout restart deployment/control-plane   # pick up a rebuilt image
 kubectl -n edge rollout status deployment/control-plane --timeout=180s
 kubectl -n edge rollout status deployment/envoy-canary --timeout=120s

@@ -4,10 +4,10 @@ import jakarta.annotation.PostConstruct;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
@@ -18,7 +18,8 @@ import org.springframework.stereotype.Service;
 /**
  * Canary rollout: push candidate routes to the canary group only, wait until the canary Envoys
  * ACK them, probe the canary, then either promote to the stable group or roll the canary back to
- * the last known-good routes.
+ * the last known-good routes. Every rollout is stored in PostgreSQL, and the last promoted routes
+ * are restored on startup.
  */
 @Service
 public class RolloutService {
@@ -32,27 +33,47 @@ public class RolloutService {
   private final HealthProbe probe;
   private final RolloutPolicy policy;
   private final EdgeProperties props;
+  private final RolloutRepository repo;
 
   private final AtomicLong version = new AtomicLong();
   private final AtomicReference<Map<String, String>> stableRoutes = new AtomicReference<>();
   private final AtomicReference<Map<String, String>> canaryRoutes = new AtomicReference<>();
   private final ReentrantLock rolloutLock = new ReentrantLock();
-  private final List<RolloutRecord> history = Collections.synchronizedList(new ArrayList<>());
 
-  public RolloutService(XdsServer xds, HealthProbe probe, RolloutPolicy policy, EdgeProperties props) {
+  public RolloutService(XdsServer xds, HealthProbe probe, RolloutPolicy policy,
+      EdgeProperties props, RolloutRepository repo) {
     this.xds = xds;
     this.probe = probe;
     this.policy = policy;
     this.props = props;
+    this.repo = repo;
   }
 
+  /**
+   * Restores the last promoted routes from the database (or uses the configured initial routes
+   * on a fresh database) and pushes them to both groups. Versions continue from the database, so
+   * a restart never reuses a version number.
+   */
   @PostConstruct
   void init() {
-    Map<String, String> initial = Map.copyOf(props.initialRoutes());
-    stableRoutes.set(initial);
-    push(STABLE, initial);
-    push(CANARY, initial);
-    log.info("Initial routes pushed to both groups: {}", initial);
+    version.set(repo.maxVersion());
+    Map<String, String> routes = Map.copyOf(props.initialRoutes());
+    String source = "initial routes from config";
+    Optional<RolloutEntity> last = repo.findFirstByOutcomeOrderByVersionDesc("promoted");
+    if (last.isPresent()) {
+      RolloutRecord r = last.get().toRecord();
+      List<String> problems = validate(r.routes());
+      if (problems.isEmpty()) {
+        routes = r.routes();
+        source = "last promoted rollout v" + r.version();
+      } else {
+        log.warn("Not restoring v{}, its backends are no longer configured: {}", r.version(), problems);
+      }
+    }
+    stableRoutes.set(routes);
+    push(STABLE, routes);
+    push(CANARY, routes);
+    log.info("Pushed {} to both groups: {}", source, routes);
   }
 
   /**
@@ -66,7 +87,7 @@ public class RolloutService {
         problems.add("hostname must not be blank");
       } else if (backend == null || !props.backends().containsKey(backend)) {
         problems.add(host + ": unknown backend '" + backend + "', expected one of "
-            + new java.util.TreeSet<>(props.backends().keySet()));
+            + new TreeSet<>(props.backends().keySet()));
       }
     });
     return problems;
@@ -74,6 +95,20 @@ public class RolloutService {
 
   /** Runs one rollout. Returns empty if another rollout is already in progress. */
   public Optional<RolloutRecord> rollout(Map<String, String> candidate) throws InterruptedException {
+    return rollout(candidate, null);
+  }
+
+  /** The stored rollout with this version, if any. */
+  public Optional<RolloutRecord> find(long version) {
+    return repo.findById(version).map(RolloutEntity::toRecord);
+  }
+
+  /**
+   * Runs one rollout. {@code revertedFrom} is the earlier version whose routes are being rolled
+   * out again, or null. A revert goes through the canary like any other change.
+   */
+  public Optional<RolloutRecord> rollout(Map<String, String> candidate, Long revertedFrom)
+      throws InterruptedException {
     if (!rolloutLock.tryLock()) {
       return Optional.empty();
     }
@@ -102,8 +137,9 @@ public class RolloutService {
           result.failed(), result.total(), Math.round(result.errorRate() * 100));
 
       RolloutRecord record = new RolloutRecord(v, Instant.now(), routes, outcome,
-          ack.name().toLowerCase(), result.total(), result.failed(), result.errorRate());
-      history.add(record);
+          ack.name().toLowerCase(), result.total(), result.failed(), result.errorRate(),
+          revertedFrom);
+      repo.save(RolloutEntity.from(record));
       return Optional.of(record);
     } finally {
       rolloutLock.unlock();
@@ -118,10 +154,9 @@ public class RolloutService {
     return canaryRoutes.get();
   }
 
+  /** Every rollout ever run, oldest first, from the database. */
   public List<RolloutRecord> history() {
-    synchronized (history) {
-      return List.copyOf(history);
-    }
+    return repo.findAllByOrderByVersionAsc().stream().map(RolloutEntity::toRecord).toList();
   }
 
   private long push(String group, Map<String, String> routes) {
@@ -141,5 +176,6 @@ public class RolloutService {
       String canaryAck,
       int probeRequests,
       int probeFailures,
-      double errorRate) {}
+      double errorRate,
+      Long revertedFrom) {}
 }

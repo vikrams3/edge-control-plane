@@ -5,6 +5,19 @@ services:
   control-plane:
     build: ./control-plane
     ports: ["8080:8080"]
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  # Rollout history; the control plane restores the last promoted routes from here on startup.
+  postgres:
+    image: postgres:16-alpine
+    environment: {POSTGRES_DB: edge, POSTGRES_USER: edge, POSTGRES_PASSWORD: edge}
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "edge", "-d", "edge"]
+      interval: 2s
+      retries: 30
 
   envoy-canary:
     image: envoyproxy/envoy:v1.31-latest
@@ -33,3 +46,6 @@ services:
     image: hashicorp/http-echo
     command: ["-text=hello from billing", "-listen=:8080"]
     scale: 0
+
+volumes:
+  pgdata:

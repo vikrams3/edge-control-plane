@@ -1,6 +1,16 @@
 server:
   port: 8080
 
+spring:
+  datasource:
+    url: jdbc:postgresql://postgres:5432/edge
+    username: edge
+    password: edge
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate      # Flyway owns the schema
+
 management:
   endpoints:
     web:

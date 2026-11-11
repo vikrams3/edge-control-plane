@@ -9,7 +9,7 @@ class RolloutValidationTest {
 
   private final RolloutService service = new RolloutService(null, null, null,
       new EdgeProperties(18000, "http://x",
-          Map.of("tableau", "tableau:8080", "sales", "sales:8080"), Map.of(), 10, 0.05, 1000));
+          Map.of("tableau", "tableau:8080", "sales", "sales:8080"), Map.of(), 10, 0.05, 1000), null);
 
   @Test
   void knownBackendsAreValid() {

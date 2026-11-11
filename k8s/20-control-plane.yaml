@@ -22,6 +22,12 @@ spec:
                       "backends": {"tableau": "tableau.edge.svc.cluster.local:8080",
                                    "sales": "sales.edge.svc.cluster.local:8080",
                                    "billing": "billing.edge.svc.cluster.local:8080"}}}
+        - name: SPRING_DATASOURCE_URL
+          value: jdbc:postgresql://postgres.edge.svc.cluster.local:5432/edge
+        - name: SPRING_DATASOURCE_USERNAME
+          valueFrom: {secretKeyRef: {name: postgres, key: username}}
+        - name: SPRING_DATASOURCE_PASSWORD
+          valueFrom: {secretKeyRef: {name: postgres, key: password}}
         readinessProbe:
           httpGet: {path: /actuator/health, port: 8080}
           initialDelaySeconds: 5
