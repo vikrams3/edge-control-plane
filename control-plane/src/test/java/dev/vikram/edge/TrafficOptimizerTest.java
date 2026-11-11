@@ -93,7 +93,8 @@ class TrafficOptimizerTest {
     when(rollouts.applyWeights(any(), any())).thenReturn(true);
     var edge = new EdgeProperties(0, "http://x", Map.of(), Map.of(), 1, 0.05, 1, "synthetic",
         "http://p", 30, null, null, "http://a");
-    var optimizer = new TrafficOptimizer(p, weights, rollouts, new SimpleMeterRegistry(), edge);
+    var optimizer = new TrafficOptimizer(p, weights, rollouts, new SimpleMeterRegistry(), edge,
+        BackendOptions.none());
     Map<String, MemberStats> slowB = new HashMap<>(Map.of(
         "a", new MemberStats(100, 50, 100, 0), "b", new MemberStats(100, 500, 100, 0)));
 
@@ -119,9 +120,9 @@ class TrafficOptimizerTest {
     var idleB = new MemberStats(0, 0, 0, 0);
     // second ejection in a row: 60 s is no longer enough, 120 s is
     assertThat(TrafficOptimizer.decide(w, Map.of("a", healthyA, "b", idleB), p,
-        Map.of("b", NOW - 60_000), Map.of("b", 2), NOW).kind()).isEqualTo(Kind.HOLD);
+        Map.of("b", NOW - 60_000), Map.of("b", 2), Map.of(), NOW).kind()).isEqualTo(Kind.HOLD);
     assertThat(TrafficOptimizer.decide(w, Map.of("a", healthyA, "b", idleB), p,
-        Map.of("b", NOW - 120_000), Map.of("b", 2), NOW).kind()).isEqualTo(Kind.READMIT);
+        Map.of("b", NOW - 120_000), Map.of("b", 2), Map.of(), NOW).kind()).isEqualTo(Kind.READMIT);
   }
 
   @Test
@@ -130,5 +131,20 @@ class TrafficOptimizerTest {
     var d = decide(Map.of("a", 50, "b", 50), new MemberStats(300, 50, 100, 0),
         new MemberStats(300, 50, 100, 100), Map.of());
     assertThat(d.kind()).isEqualTo(Kind.EJECT);
+  }
+
+  @Test
+  void aMemberWithAHealthPathComesBackOnlyWhenItsHealthChecksPass() {
+    var w = Map.of("a", 100, "b", 0);
+    var a = new MemberStats(100, 50, 30, 0);
+    var b = new MemberStats(0, 0, 0, 0);
+    // long past any backoff, but the health checks still fail: no user traffic is risked
+    assertThat(TrafficOptimizer.decide(w, Map.of("a", a, "b", b), p, Map.of("b", NOW - 3_600_000),
+        Map.of("b", 5), Map.of("b", false), NOW).kind()).isEqualTo(Kind.HOLD);
+    // 10 s after ejection, but healthy: straight back in
+    var d = TrafficOptimizer.decide(w, Map.of("a", a, "b", b), p, Map.of("b", NOW - 10_000),
+        Map.of("b", 1), Map.of("b", true), NOW);
+    assertThat(d.kind()).isEqualTo(Kind.READMIT);
+    assertThat(d.weights()).isEqualTo(Map.of("a", 90, "b", 10));
   }
 }

@@ -68,7 +68,7 @@ class EdgeConfigTest {
   @Test
   void streamingBackendGetsNoRouteTimeoutButAnIdleTimeout() {
     var options = new BackendOptions(Map.of("llm", new BackendOptions.Options(
-        java.time.Duration.ZERO, java.time.Duration.ofSeconds(30))));
+        java.time.Duration.ZERO, java.time.Duration.ofSeconds(30), null)));
     var rc = EdgeConfig.routeTable(Map.of("llm.local", "llm", "a.local", "sales"), Map.of(), options);
     var llm = rc.getVirtualHostsList().stream().filter(v -> v.getName().equals("llm.local"))
         .findFirst().orElseThrow().getRoutes(0).getRoute();

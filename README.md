@@ -158,7 +158,8 @@ Kafka: too little real traffic for [pay.edge.local]; synthetic probe: 25 of 25 f
 - At most 10 points per step, and only after **two consecutive readings** propose the same move (one noisy reading moved traffic in an early version).
 - Each member keeps at least 10% of traffic, so a slower one stays measured.
 - It acts only on a p99 more than 20% worse, and only with at least 20 requests per member.
-- **A failing member is ejected at once** (5xx at or above 50% over the last 20 s): weight 0, below the floor. It is re-tested with 10% after 60 s, doubling to 120 s, 240 s… up to 10 minutes while it stays broken, like Envoy's outlier detection. Errors act immediately; latency waits for confirmation.
+- **A failing member is ejected at once** (5xx at or above 50% over the last 20 s): weight 0, below the floor. Errors act immediately; latency waits for confirmation.
+- **It comes back on health checks, not on users.** While a member is ejected, the control plane checks its health path directly every step and re-admits it with 10% after two passes in a row. Members without a health path are re-tested with 10% of real traffic instead, with backoff (60 s, 120 s, 240 s… up to 10 minutes), like Envoy's outlier detection.
 - When the members are equal again, it drifts back to even.
 - It never changes weights while a rollout is running, and the split survives a control plane restart (PostgreSQL).
 
@@ -174,10 +175,12 @@ With `BREAK=fail`, `tableau-b` returns 503 for every request instead:
 
 | Phase | Result |
 | --- | --- |
-| `tableau-b` breaks | Ejected (100/0) within about 60 s; about 250 requests failed in that time |
-| Control plane restarted mid-failure | Split before and after: 100/0, read back from PostgreSQL |
-| Still broken | Re-tested after 60 s, then 120 s: each re-test costs about 50 failed requests, and they get rarer |
-| Healed | Re-admitted at the next re-test. The backoff is the cost here: one re-test landed a second before the fix, so it was ejected a third time and waited 240 s. Active health checks (re-admit when a check passes, not by risking user traffic) are the next step |
+| `tableau-b` breaks | Ejected (100/0) within about 60 s |
+| Control plane restarted mid-failure | Split before and after: 100/0, read back from PostgreSQL; `tableau-b` stays out because its health checks still fail |
+| Still broken, about 3 minutes | **0 failed requests**: no user traffic is spent on re-testing it |
+| Healed | Two passing health checks, then 10%, then back toward even after two agreeing readings: re-admitted in under 60 s |
+
+An earlier version re-tested ejected members with 10% of real traffic and exponential backoff. Each re-test cost about 50 failed requests while the member stayed broken, and once it was fixed, recovery took 240 s or more because of the backoff. That remains the fallback for backends without a health path.
 
 The honest result of the latency demo: the share of slow requests fell from 50% to 10%, but p99 did not improve, because 10% is far above 1%. The floor keeps the slow pool measured, so it can win traffic back, and that costs the tail. For a member that is clearly broken, Envoy outlier detection (eject it) is the better tool; the optimizer is for gradual shifts. One early step was also caused by noise (a coarse histogram bucket made 100 ms vs 50 ms look real), and reversed one step later. Requiring two agreeing readings before acting would remove that.
 
@@ -274,7 +277,7 @@ CloudFront, Cloud CDN, Cloudflare and Akamai solve a different, bigger problem: 
 
 1. **Operate it like production:** GKE.
 2. **Multi-cloud:** cross-cloud failover from GKE to AWS by Envoy locality priority with active health checks.
-3. **Hardening:** active health checks to re-admit an ejected pool member without risking user traffic; persist ejection state across restarts (today a restart re-tests an ejected member at once); mTLS on xDS in Docker Compose too.
+3. **Hardening:** mTLS on xDS in Docker Compose too; a deeper health check than `/` for real backends.
 
 ## License
 

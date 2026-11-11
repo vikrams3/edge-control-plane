@@ -17,8 +17,14 @@ public record BackendOptions(Map<String, Options> backendOptions) {
   /**
    * @param timeout whole-response timeout; 0 turns it off (Envoy's default is 15 s)
    * @param idleTimeout cut a stream that sends nothing for this long, so a hung upstream still ends
+   * @param healthPath HTTP path the control plane checks to re-admit an ejected pool member
    */
-  public record Options(Duration timeout, Duration idleTimeout) {}
+  public record Options(Duration timeout, Duration idleTimeout, String healthPath) {}
+
+  public String healthPath(String backend) {
+    Options o = backendOptions().get(backend);
+    return o == null ? null : o.healthPath();
+  }
 
   public Map<String, Options> backendOptions() {
     return backendOptions == null ? Map.of() : backendOptions;

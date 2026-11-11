@@ -37,6 +37,11 @@ import org.springframework.stereotype.Component;
  *
  * Errors act at once; latency waits for confirmation, because a coarse histogram bucket can make
  * one reading look worse than it is. Never changes weights while a rollout runs.
+ *
+ * <p>An ejected member with a health path (BackendOptions) is re-admitted after two consecutive
+ * passing health checks that the control plane makes itself, so no user request is spent on a
+ * member that is still broken. Without a health path it is re-tested with real traffic, with
+ * exponential backoff.
  */
 @Component
 @ConditionalOnProperty(name = "edge.optimizer.enabled", havingValue = "true")
@@ -74,14 +79,21 @@ public class TrafficOptimizer {
   /** pool -> the weights the last reading proposed, waiting for confirmation */
   private final Map<String, Map<String, Integer>> pending = new ConcurrentHashMap<>();
   private final Map<String, Integer> agreeing = new ConcurrentHashMap<>();
+  /** member -> consecutive passing health checks while ejected */
+  private final Map<String, Integer> healthPasses = new ConcurrentHashMap<>();
+  static final int HEALTH_PASSES_TO_READMIT = 2;
+  private final BackendOptions options;
+  private final Map<String, String> backends;
 
   public TrafficOptimizer(OptimizerProperties props, TrafficWeights weights,
-      RolloutService rollouts, MeterRegistry metrics, EdgeProperties edge) {
+      RolloutService rollouts, MeterRegistry metrics, EdgeProperties edge, BackendOptions options) {
     this.props = props;
     this.weights = weights;
     this.rollouts = rollouts;
     this.metrics = metrics;
     this.analytics = edge.analyticsUrl();
+    this.options = options;
+    this.backends = edge.backends() == null ? Map.of() : edge.backends();
   }
 
   @PostConstruct
@@ -118,7 +130,18 @@ public class TrafficOptimizer {
         count.remove(m);
       }
     });
-    Decision d = decide(current, stats, props, out, count, now);
+    Map<String, Boolean> health = new LinkedHashMap<>();
+    for (String m : current.keySet()) {
+      if (current.get(m) == 0 && options.healthPath(m) != null) {
+        boolean ok = healthCheck(m);
+        int passes = ok ? healthPasses.merge(m, 1, Integer::sum) : 0;
+        if (!ok) {
+          healthPasses.remove(m);
+        }
+        health.put(m, passes >= HEALTH_PASSES_TO_READMIT);
+      }
+    }
+    Decision d = decide(current, stats, props, out, count, health, now);
     switch (d.kind()) {
       case HOLD -> {
         pending.remove(pool);
@@ -132,6 +155,7 @@ public class TrafficOptimizer {
             count.merge(d.member(), 1, Integer::sum);
           } else {
             out.remove(d.member());
+            healthPasses.remove(d.member());
           }
         }
       }
@@ -148,6 +172,22 @@ public class TrafficOptimizer {
               props.confirmations(), sorted(d.weights()), d.reason());
         }
       }
+    }
+  }
+
+  /** GET http://host:port/healthPath on the member directly; true for a 2xx within 1 s. */
+  boolean healthCheck(String member) {
+    String hostPort = backends.get(member);
+    String path = options.healthPath(member);
+    if (hostPort == null || path == null) {
+      return false;
+    }
+    try {
+      int status = http.send(HttpRequest.newBuilder(URI.create("http://" + hostPort + path))
+          .timeout(Duration.ofSeconds(1)).GET().build(), BodyHandlers.discarding()).statusCode();
+      return status >= 200 && status < 300;
+    } catch (Exception e) {
+      return false;
     }
   }
 
@@ -193,7 +233,7 @@ public class TrafficOptimizer {
    */
   static Decision decide(Map<String, Integer> current, Map<String, MemberStats> stats,
       OptimizerProperties p, Map<String, Long> ejectedSince, long now) {
-    return decide(current, stats, p, ejectedSince, Map.of(), now);
+    return decide(current, stats, p, ejectedSince, Map.of(), Map.of(), now);
   }
 
   /** How long the member stays out after its n-th ejection in a row: base, 2x, 4x... capped. */
@@ -202,16 +242,31 @@ public class TrafficOptimizer {
     return Math.min(ms, Math.max(MAX_EJECTION_MS, p.ejectionSeconds() * 1000L));
   }
 
-  /** @param ejectionsInARow per member, how many times in a row it was ejected */
+  /**
+   * @param ejectionsInARow per member, how many times in a row it was ejected
+   * @param healthy per ejected member that has a health path: whether its health checks passed
+   *     enough times to re-admit it; members without a health path are absent
+   */
   static Decision decide(Map<String, Integer> current, Map<String, MemberStats> stats,
       OptimizerProperties p, Map<String, Long> ejectedSince, Map<String, Integer> ejectionsInARow,
-      long now) {
+      Map<String, Boolean> healthy, long now) {
     MemberStats none = new MemberStats(0, 0, 0, 0);
 
-    // 1. An ejected member whose time is up gets the floor back, to show whether it recovered.
+    // 1a. An ejected member with a health path comes back when its health checks pass:
+    //     no user request is spent finding out.
+    for (String m : current.keySet()) {
+      if (current.get(m) == 0 && Boolean.TRUE.equals(healthy.get(m))) {
+        String donor = largest(current);
+        return new Decision(shift(current, donor, m, p.minWeightPercent()), Kind.READMIT, m,
+            m + " passed " + HEALTH_PASSES_TO_READMIT + " health checks in a row; giving it "
+                + p.minWeightPercent() + "%");
+      }
+    }
+    // 1b. Without a health path, it is re-tested with real traffic once its ejection time is up.
     for (String m : current.keySet()) {
       long out = ejectionMs(p, ejectionsInARow.getOrDefault(m, 1));
-      if (current.get(m) == 0 && now - ejectedSince.getOrDefault(m, 0L) >= out) {
+      if (current.get(m) == 0 && !healthy.containsKey(m)
+          && now - ejectedSince.getOrDefault(m, 0L) >= out) {
         String donor = largest(current);
         return new Decision(shift(current, donor, m, p.minWeightPercent()), Kind.READMIT, m,
             m + " was ejected " + out / 1000 + " s ago; giving it "

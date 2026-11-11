@@ -25,7 +25,9 @@ spec:
                                    "tableau-a": "tableau-a.edge.svc.cluster.local:8080",
                                    "tableau-b": "tableau-b.edge.svc.cluster.local:8080",
                                    "llm": "llm.edge.svc.cluster.local:8080"},
-                      "backend-options": {"llm": {"timeout": "0s", "idle-timeout": "30s"}},
+                      "backend-options": {"llm": {"timeout": "0s", "idle-timeout": "30s"},
+                                         "tableau-a": {"health-path": "/"},
+                                         "tableau-b": {"health-path": "/"}},
                       "optimizer": {"enabled": true, "pools": {"tableau-pool": ["tableau-a", "tableau-b"]}}}}
         - name: SPRING_DATASOURCE_URL
           value: jdbc:postgresql://postgres.edge.svc.cluster.local:5432/edge
