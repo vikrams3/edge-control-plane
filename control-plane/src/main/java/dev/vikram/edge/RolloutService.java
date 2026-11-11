@@ -4,6 +4,7 @@ import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -11,9 +12,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.TreeSet;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Stream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -42,7 +48,14 @@ public class RolloutService {
   private final AtomicLong version = new AtomicLong();
   private final AtomicReference<Map<String, String>> stableRoutes = new AtomicReference<>();
   private final AtomicReference<Map<String, String>> canaryRoutes = new AtomicReference<>();
-  private final ReentrantLock rolloutLock = new ReentrantLock();
+  /**
+   * One rollout at a time. A Semaphore rather than a lock, because the request thread acquires
+   * it and the background thread that finishes the rollout releases it.
+   */
+  private final Semaphore oneRollout = new Semaphore(1);
+  /** Rollouts still running, by version; finished ones live in the database. */
+  private final Map<Long, RolloutRecord> running = new ConcurrentHashMap<>();
+  private final ExecutorService workers = Executors.newVirtualThreadPerTaskExecutor();
 
   public RolloutService(XdsServer xds, HealthProbe probe, RolloutPolicy policy,
       EdgeProperties props, RolloutRepository repo, MeterRegistry metrics) {
@@ -104,61 +117,91 @@ public class RolloutService {
     return problems;
   }
 
-  /** Runs one rollout. Returns empty if another rollout is already in progress. */
-  public Optional<RolloutRecord> rollout(Map<String, String> candidate) throws InterruptedException {
-    return rollout(candidate, null);
-  }
-
-  /** The stored rollout with this version, if any. */
-  public Optional<RolloutRecord> find(long version) {
-    return repo.findById(version).map(RolloutEntity::toRecord);
-  }
+  /** A started rollout: its in-progress record now, and the final record when it finishes. */
+  public record Started(RolloutRecord record, CompletableFuture<RolloutRecord> done) {}
 
   /**
-   * Runs one rollout. {@code revertedFrom} is the earlier version whose routes are being rolled
-   * out again, or null. A revert goes through the canary like any other change.
+   * Starts a rollout: pushes the candidate to the canary now and returns at once; the ACK wait,
+   * probe and promote-or-rollback run on a virtual thread. Returns empty if another rollout is
+   * already in progress. {@code revertedFrom} is the earlier version being rolled out again, or
+   * null; a revert goes through the canary like any other change.
    */
-  public Optional<RolloutRecord> rollout(Map<String, String> candidate, Long revertedFrom)
-      throws InterruptedException {
-    if (!rolloutLock.tryLock()) {
+  public Optional<Started> start(Map<String, String> candidate, Long revertedFrom) {
+    if (!oneRollout.tryAcquire()) {
       return Optional.empty();
     }
-    Timer.Sample timer = Timer.start(metrics);
     try {
       Map<String, String> routes = Map.copyOf(candidate);
+      Timer.Sample timer = Timer.start(metrics);
       long v = push(CANARY, routes);
       log.info("v{} pushed to canary: {}", v, routes);
+      RolloutRecord pending = new RolloutRecord(v, null, routes, "in_progress", "pending",
+          0, 0, 0.0, revertedFrom);
+      running.put(v, pending);
+      CompletableFuture<RolloutRecord> done = CompletableFuture.supplyAsync(
+          () -> finish(pending, timer), workers);
+      return Optional.of(new Started(pending, done));
+    } catch (RuntimeException e) {
+      oneRollout.release();
+      throw e;
+    }
+  }
 
+  /** Runs on a virtual thread: wait for ACKs, probe, promote or roll back, store the result. */
+  private RolloutRecord finish(RolloutRecord pending, Timer.Sample timer) {
+    long v = pending.version();
+    Map<String, String> routes = pending.routes();
+    String ackName = "error";
+    HealthProbe.ProbeResult result = new HealthProbe.ProbeResult(0, 0);
+    String outcome = "rolled_back";
+    try {
       // Wait for every canary Envoy to confirm it applied v, instead of sleeping and hoping.
       ConfigAckTracker.AckStatus ack =
           xds.awaitAck(CANARY, v, Duration.ofMillis(props.ackTimeoutMillis()));
-      HealthProbe.ProbeResult result = ack == ConfigAckTracker.AckStatus.ACKED
-          ? probe.probe(routes.keySet())
-          : new HealthProbe.ProbeResult(0, 0);   // nothing to probe; counts as a failure
-
-      String outcome;
+      ackName = ack.name().toLowerCase();
+      if (ack == ConfigAckTracker.AckStatus.ACKED) {
+        result = probe.probe(routes.keySet());
+      }   // otherwise nothing to probe; an empty result counts as a failure
       if (ack == ConfigAckTracker.AckStatus.ACKED && policy.shouldPromote(result)) {
         stableRoutes.set(routes);
         push(STABLE, routes);
         outcome = "promoted";
-      } else {
-        push(CANARY, stableRoutes.get());   // automatic rollback
-        outcome = "rolled_back";
       }
-      log.info("v{} {}: canary {}, {} of {} probe requests failed ({}%)", v, outcome, ack,
-          result.failed(), result.total(), Math.round(result.errorRate() * 100));
-
-      RolloutRecord record = new RolloutRecord(v, Instant.now(), routes, outcome,
-          ack.name().toLowerCase(), result.total(), result.failed(), result.errorRate(),
-          revertedFrom);
-      repo.save(RolloutEntity.from(record));
-      metrics.counter("edge.rollouts", "outcome", outcome, "canary_ack", record.canaryAck())
-          .increment();
-      timer.stop(metrics.timer("edge.rollout.duration", "outcome", outcome));
-      return Optional.of(record);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    } catch (RuntimeException e) {
+      log.error("v{} failed, rolling back", v, e);
     } finally {
-      rolloutLock.unlock();
+      if (!"promoted".equals(outcome)) {
+        push(CANARY, stableRoutes.get());   // automatic rollback
+      }
     }
+    log.info("v{} {}: canary {}, {} of {} probe requests failed ({}%)", v, outcome, ackName,
+        result.failed(), result.total(), Math.round(result.errorRate() * 100));
+
+    RolloutRecord record = new RolloutRecord(v, Instant.now(), routes, outcome, ackName,
+        result.total(), result.failed(), result.errorRate(), pending.revertedFrom());
+    try {
+      repo.save(RolloutEntity.from(record));
+      metrics.counter("edge.rollouts", "outcome", outcome, "canary_ack", ackName).increment();
+      timer.stop(metrics.timer("edge.rollout.duration", "outcome", outcome));
+    } finally {
+      running.remove(v);
+      oneRollout.release();
+    }
+    return record;
+  }
+
+  /** A rollout by version: still running, or from the database. */
+  public Optional<RolloutRecord> find(long version) {
+    RolloutRecord live = running.get(version);
+    return live != null ? Optional.of(live)
+        : repo.findById(version).map(RolloutEntity::toRecord);
+  }
+
+  @PreDestroy
+  void stop() {
+    workers.shutdown();
   }
 
   public Map<String, String> stableRoutes() {
@@ -169,9 +212,14 @@ public class RolloutService {
     return canaryRoutes.get();
   }
 
-  /** Every rollout ever run, oldest first, from the database. */
+  /** Every rollout ever run, oldest first, including one still in progress. */
   public List<RolloutRecord> history() {
-    return repo.findAllByOrderByVersionAsc().stream().map(RolloutEntity::toRecord).toList();
+    // keyed by version, database last, so a rollout that just finished is listed once
+    Map<Long, RolloutRecord> byVersion = new java.util.TreeMap<>();
+    Stream.concat(running.values().stream(),
+            repo.findAllByOrderByVersionAsc().stream().map(RolloutEntity::toRecord))
+        .forEach(r -> byVersion.put(r.version(), r));
+    return List.copyOf(byVersion.values());
   }
 
   private long push(String group, Map<String, String> routes) {
@@ -183,6 +231,7 @@ public class RolloutService {
     return v;
   }
 
+  /** One rollout. {@code outcome} is in_progress, promoted or rolled_back. */
   public record RolloutRecord(
       long version,
       Instant finishedAt,

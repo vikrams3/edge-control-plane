@@ -44,7 +44,21 @@ flowchart LR
 | `RolloutPolicy` / `ErrorRatePolicy` | Strategy for the promote decision; today an error-rate threshold (5%) |
 | `RolloutEntity` / `RolloutRepository` | JPA entity and Spring Data repository for the `rollouts` table (routes stored as `jsonb`) |
 | `db/migration/V1__rollouts.sql` | Flyway migration that creates the schema |
-| `RolloutController.java` | REST API: `GET /v1/routes`, `POST /v1/rollouts`, `GET /v1/rollouts`, `POST /v1/rollouts/{version}/revert` |
+| `RolloutController.java` | REST API (below), documented with springdoc-openapi |
+
+## API
+
+A rollout can take 40 s with the Prometheus probe, so starting one is asynchronous: `202 Accepted` with a `Location` to poll. Add `?wait=true` to block and get the final result with `200` instead; the demo script does this. The OpenAPI spec is at `/v3/api-docs` and Swagger UI at `/swagger-ui.html`.
+
+| Method and path | Returns |
+| --- | --- |
+| `GET /v1/routes` | Current routes on the stable and canary groups |
+| `POST /v1/rollouts` | `202` + `Location` (or `200` with `?wait=true`); `400` empty table or unknown backend; `409` a rollout is running |
+| `GET /v1/rollouts/{version}` | One rollout: `in_progress`, `promoted` or `rolled_back`; `404` if unknown |
+| `GET /v1/rollouts` | Every rollout, oldest first, including one in progress |
+| `POST /v1/rollouts/{version}/revert` | Same codes as `POST /v1/rollouts`, plus `404` for an unknown version |
+
+One rollout at a time is enforced with a `Semaphore`, not a lock: the request thread acquires it, and the virtual thread that finishes the rollout releases it.
 
 ## Run it
 
@@ -140,7 +154,7 @@ Getting here took three tuning runs. Each row is the steady state at the end of 
 
 ## Roadmap
 
-1. **Operate it like production:** TLS termination with SDS, OpenAPI spec, Testcontainers test against a real Envoy, Jenkins pipeline, GKE.
+1. **Operate it like production:** TLS termination with SDS, Testcontainers test against a real Envoy, Jenkins pipeline, GKE.
 2. **Analytics and self-optimizing:** Envoy access logs to Kafka, a Kafka Streams job computing per-route error rate and p99, the control plane shifting `weighted_clusters` toward the faster backend pool, long-lived streaming (LLM-style) load tests, cross-cloud failover from GKE to AWS by Envoy priority.
 
 ## License

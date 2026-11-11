@@ -19,7 +19,7 @@ echo -n "sales.edge.local   -> "; curl -s -H 'Host: sales.edge.local' "$EDGE/"
 pause
 
 step "Good change: add crm.edge.local -> sales. Expect: promoted"
-curl -s -X POST "$CP/v1/rollouts" -H 'Content-Type: application/json' -d '{
+curl -s -X POST "$CP/v1/rollouts?wait=true" -H 'Content-Type: application/json' -d '{
   "tableau.edge.local": "tableau",
   "sales.edge.local": "sales",
   "crm.edge.local": "sales"}'; echo
@@ -27,14 +27,14 @@ echo -n "crm.edge.local on stable -> "; curl -s -H 'Host: crm.edge.local' "$EDGE
 pause
 
 step "Typo in the backend name (salez). Expect: 400, rejected before any Envoy sees it"
-curl -s -w '  (HTTP %{http_code})' -X POST "$CP/v1/rollouts" -H 'Content-Type: application/json' -d '{
+curl -s -w '  (HTTP %{http_code})' -X POST "$CP/v1/rollouts?wait=true" -H 'Content-Type: application/json' -d '{
   "tableau.edge.local": "tableau",
   "sales.edge.local": "salez",
   "crm.edge.local": "sales"}'; echo
 pause
 
 step "Bad change: move crm.edge.local to billing, which is down. Expect: rolled_back"
-curl -s -X POST "$CP/v1/rollouts" -H 'Content-Type: application/json' -d '{
+curl -s -X POST "$CP/v1/rollouts?wait=true" -H 'Content-Type: application/json' -d '{
   "tableau.edge.local": "tableau",
   "sales.edge.local": "sales",
   "crm.edge.local": "billing"}'; echo
