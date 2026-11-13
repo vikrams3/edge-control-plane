@@ -4,6 +4,28 @@ A small edge control plane in Java. It pushes routing config to a fleet of [Envo
 
 It's a scaled-down version of the problem an edge platform team solves: routing incoming requests to the right backend service, and changing that routing safely across many nodes.
 
+## At a glance
+
+| What | Result |
+| --- | --- |
+| [Canary rollout](#demo-output) | A good change is promoted in about 0.4 s, after the canary ACKs it over xDS and 75 of 75 probe requests pass. A route to a down backend fails 25 of 25 probes on the canary and rolls back; stable never sees it |
+| [Cross-region failover on GKE](#cross-site-failover-kind-and-gke) | The local backend goes down: Envoy moves traffic from us-central1 to us-east1 in about 5 s with 0 failed requests, and back by itself |
+| [Control plane outage](#control-plane-outage-kind) | Control plane down for 2 minutes under 200 req/s: 35,846 of 35,846 user requests succeed |
+| [Self-optimizing routing](#self-optimizing-routing-kind) | Weight moves away from a slow backend (50/50 to 90/10) and a failing one is ejected, then re-admitted when health checks pass |
+| [Auto-scaling](#auto-scaling-under-load-kind) | 1 to 16 pods under load: 4x the throughput, median latency 173 ms to 20 ms |
+| [Live-site practice](docs/postmortem-2026-11-11-bad-route-promoted.md) | A runbook, and a postmortem of a real bad promotion found while building this |
+
+See the demo in about 5 minutes with only Docker installed:
+
+```bash
+git clone https://github.com/vikrams3/edge-control-plane && cd edge-control-plane
+docker compose up --build -d     # builds and unit-tests the control plane, starts 3 Envoys and the backends
+./scripts/demo.sh                # press Enter between steps: promote, reject a typo, automatic rollback
+docker compose down
+```
+
+Java 21, Spring Boot 3.5, [java-control-plane](https://github.com/envoyproxy/java-control-plane), Envoy, PostgreSQL, Kubernetes (kind and GKE), Prometheus and Grafana, Kafka Streams, Jenkins. 51 automated tests, including integration tests against a real Envoy and a real PostgreSQL.
+
 ## Architecture
 
 ```mermaid
