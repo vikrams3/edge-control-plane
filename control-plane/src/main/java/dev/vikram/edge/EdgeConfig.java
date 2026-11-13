@@ -12,6 +12,8 @@ import io.envoyproxy.envoy.config.core.v3.AggregatedConfigSource;
 import io.envoyproxy.envoy.config.core.v3.ApiVersion;
 import io.envoyproxy.envoy.config.core.v3.ConfigSource;
 import io.envoyproxy.envoy.config.core.v3.DataSource;
+import io.envoyproxy.envoy.config.core.v3.HealthCheck;
+import io.envoyproxy.envoy.config.core.v3.Locality;
 import io.envoyproxy.envoy.config.core.v3.SocketAddress;
 import io.envoyproxy.envoy.config.core.v3.SubstitutionFormatString;
 import io.envoyproxy.envoy.config.core.v3.TransportSocket;
@@ -25,12 +27,14 @@ import io.envoyproxy.envoy.config.listener.v3.Listener;
 import io.envoyproxy.envoy.config.route.v3.Route;
 import io.envoyproxy.envoy.config.route.v3.RouteAction;
 import io.envoyproxy.envoy.config.route.v3.RouteConfiguration;
+import io.envoyproxy.envoy.config.route.v3.RetryPolicy;
 import io.envoyproxy.envoy.config.route.v3.RouteMatch;
 import io.envoyproxy.envoy.config.route.v3.VirtualHost;
 import io.envoyproxy.envoy.config.route.v3.WeightedCluster;
 import com.google.protobuf.UInt32Value;
 import io.envoyproxy.envoy.extensions.access_loggers.stream.v3.StdoutAccessLog;
 import io.envoyproxy.envoy.extensions.filters.http.router.v3.Router;
+import io.envoyproxy.envoy.extensions.retry.priority.previous_priorities.v3.PreviousPrioritiesConfig;
 import io.envoyproxy.envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager;
 import io.envoyproxy.envoy.extensions.filters.network.http_connection_manager.v3.HttpFilter;
 import io.envoyproxy.envoy.extensions.filters.network.http_connection_manager.v3.Rds;
@@ -95,7 +99,7 @@ public final class EdgeConfig {
       Map<String, Map<String, Integer>> pools, BackendOptions options, Optional<TlsCert> tls,
       String version) {
     List<Cluster> clusters = new TreeMap<>(backends).entrySet().stream()
-        .map(e -> cluster(e.getKey(), e.getValue()))
+        .map(e -> cluster(e.getKey(), e.getValue(), options.backendOptions().get(e.getKey())))
         .toList();
     List<Listener> listeners = new ArrayList<>(List.of(listener()));
     tls.ifPresent(c -> listeners.add(tlsListener()));
@@ -169,6 +173,9 @@ public final class EdgeConfig {
         if (o != null && o.idleTimeout() != null) {
           action.setIdleTimeout(proto(o.idleTimeout()));  // but a silent stream is still cut
         }
+        if (o != null && o.failover() != null && !o.failover().isBlank()) {
+          action.setRetryPolicy(failoverRetry());
+        }
       } else {
         WeightedCluster.Builder wc = WeightedCluster.newBuilder();
         new TreeMap<>(pool).forEach((member, weight) -> wc.addClusters(
@@ -186,19 +193,66 @@ public final class EdgeConfig {
     return rc.build();
   }
 
+  /**
+   * Covers the seconds before health checks notice the local site is down: a request that cannot
+   * connect (or whose connection is reset) is retried, and the retry skips the priority that just
+   * failed, so it goes to the failover site. "reset" can repeat a request the upstream had started,
+   * which is acceptable for these read-only backends; a backend taking writes would drop it.
+   */
+  static RetryPolicy failoverRetry() {
+    return RetryPolicy.newBuilder()
+        .setRetryOn("connect-failure,refused-stream,reset")
+        .setNumRetries(UInt32Value.of(2))
+        .setRetryPriority(RetryPolicy.RetryPriority.newBuilder()
+            .setName("envoy.retry_priorities.previous_priorities")
+            .setTypedConfig(Any.pack(PreviousPrioritiesConfig.newBuilder()
+                .setUpdateFrequency(1).build())))
+        .build();
+  }
+
   /** A cluster that resolves a Kubernetes Service name with DNS. */
   static Cluster cluster(String name, String hostPort) {
-    String[] hp = hostPort.split(":");
-    return Cluster.newBuilder()
+    return cluster(name, hostPort, null);
+  }
+
+  /**
+   * One cluster per backend. With a failover site in its options, the cluster has two
+   * priorities: 0 is the local endpoint, 1 the same backend at the other site. Envoy health-checks
+   * both and sends traffic to priority 1 only while priority 0 is unhealthy, then moves it back on
+   * its own when the local endpoint passes again, with no control plane involvement.
+   */
+  static Cluster cluster(String name, String hostPort, BackendOptions.Options options) {
+    String failover = options == null ? null : options.failover();
+    ClusterLoadAssignment.Builder endpoints = ClusterLoadAssignment.newBuilder()
+        .setClusterName(name)
+        .addEndpoints(localityEndpoints(hostPort, "local", 0));
+    Cluster.Builder c = Cluster.newBuilder()
         .setName(name)
         .setType(Cluster.DiscoveryType.STRICT_DNS)
-        .setConnectTimeout(Duration.newBuilder().setSeconds(1))
-        .setLoadAssignment(ClusterLoadAssignment.newBuilder()
-            .setClusterName(name)
-            .addEndpoints(LocalityLbEndpoints.newBuilder()
-                .addLbEndpoints(LbEndpoint.newBuilder()
-                    .setEndpoint(Endpoint.newBuilder()
-                        .setAddress(address(hp[0], Integer.parseInt(hp[1])))))))
+        .setConnectTimeout(Duration.newBuilder().setSeconds(1));
+    if (failover != null && !failover.isBlank()) {
+      endpoints.addEndpoints(localityEndpoints(failover, "failover", 1));
+      String path = options.healthPath() == null ? "/" : options.healthPath();
+      c.addHealthChecks(HealthCheck.newBuilder()
+          .setTimeout(Duration.newBuilder().setSeconds(1))
+          .setInterval(Duration.newBuilder().setSeconds(2))
+          // checks keep running when the cluster is idle, so a failover is ready before traffic
+          .setNoTrafficInterval(Duration.newBuilder().setSeconds(2))
+          .setUnhealthyThreshold(UInt32Value.of(2))     // about 4 s to fail over
+          .setHealthyThreshold(UInt32Value.of(3))       // about 6 s of passes before failing back
+          .setHttpHealthCheck(HealthCheck.HttpHealthCheck.newBuilder().setPath(path)));
+    }
+    return c.setLoadAssignment(endpoints).build();
+  }
+
+  private static LocalityLbEndpoints localityEndpoints(String hostPort, String site, int priority) {
+    String[] hp = hostPort.split(":");
+    return LocalityLbEndpoints.newBuilder()
+        .setLocality(Locality.newBuilder().setZone(site))
+        .setPriority(priority)
+        .addLbEndpoints(LbEndpoint.newBuilder()
+            .setEndpoint(Endpoint.newBuilder()
+                .setAddress(address(hp[0], Integer.parseInt(hp[1])))))
         .build();
   }
 
@@ -248,6 +302,7 @@ public final class EdgeConfig {
     f.put("status", "%RESPONSE_CODE%");
     f.put("flags", "%RESPONSE_FLAGS%");        // e.g. UF = upstream connect failure, NR = no route
     f.put("backend", "%UPSTREAM_CLUSTER%");
+    f.put("upstream_host", "%UPSTREAM_HOST%"); // which site served it, when a backend fails over
     f.put("duration_ms", "%DURATION%");
     f.put("upstream_ms", "%RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)%");
     f.put("bytes_out", "%BYTES_SENT%");

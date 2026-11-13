@@ -30,6 +30,64 @@ class EdgeConfigTest {
   }
 
   @Test
+  void backendWithoutFailoverHasOnePriorityAndNoHealthCheck() {
+    var c = EdgeConfig.cluster("sales", "sales:8080", null);
+    assertThat(c.getLoadAssignment().getEndpointsList()).hasSize(1);
+    assertThat(c.getHealthChecksList()).isEmpty();
+  }
+
+  @Test
+  void failoverSiteIsPriorityOneBehindAnActiveHealthCheck() {
+    var o = new BackendOptions.Options(null, null, "/healthz", "10.1.2.3:8080");
+    var c = EdgeConfig.cluster("sales", "sales:8080", o);
+
+    var local = c.getLoadAssignment().getEndpoints(0);
+    var remote = c.getLoadAssignment().getEndpoints(1);
+    assertThat(local.getPriority()).isZero();
+    assertThat(remote.getPriority()).isEqualTo(1);
+    assertThat(remote.getLocality().getZone()).isEqualTo("failover");
+    var addr = remote.getLbEndpoints(0).getEndpoint().getAddress().getSocketAddress();
+    assertThat(addr.getAddress()).isEqualTo("10.1.2.3");
+    assertThat(addr.getPortValue()).isEqualTo(8080);
+
+    assertThat(c.getHealthChecksList()).hasSize(1);
+    var hc = c.getHealthChecks(0);
+    assertThat(hc.getHttpHealthCheck().getPath()).isEqualTo("/healthz");
+    assertThat(hc.getUnhealthyThreshold().getValue()).isEqualTo(2);
+  }
+
+  @Test
+  void failoverHealthCheckDefaultsToRootPath() {
+    var o = new BackendOptions.Options(null, null, null, "other:8080");
+    var c = EdgeConfig.cluster("sales", "sales:8080", o);
+    assertThat(c.getHealthChecks(0).getHttpHealthCheck().getPath()).isEqualTo("/");
+  }
+
+  @Test
+  void snapshotAppliesFailoverFromBackendOptions() {
+    var options = new BackendOptions(Map.of("sales",
+        new BackendOptions.Options(null, null, null, "other:8080")));
+    var snap = EdgeConfig.snapshot(Map.of("sales", "sales:8080", "tableau", "tableau:8080"),
+        Map.of("a.local", "sales"), Map.of(), options, java.util.Optional.empty(), "1");
+    assertThat(snap.clusters().resources().get("sales").getLoadAssignment().getEndpointsCount())
+        .isEqualTo(2);
+    assertThat(snap.clusters().resources().get("tableau").getLoadAssignment().getEndpointsCount())
+        .isEqualTo(1);
+  }
+
+  @Test
+  void routeToABackendWithFailoverRetriesOnTheOtherPriority() {
+    var options = new BackendOptions(Map.of("sales",
+        new BackendOptions.Options(null, null, null, "other:8080")));
+    var rc = EdgeConfig.routeTable(Map.of("a.local", "sales", "b.local", "tableau"), Map.of(), options);
+    var sales = rc.getVirtualHosts(0).getRoutes(0).getRoute();
+    assertThat(sales.getRetryPolicy().getRetryOn()).contains("connect-failure");
+    assertThat(sales.getRetryPolicy().getRetryPriority().getName())
+        .isEqualTo("envoy.retry_priorities.previous_priorities");
+    assertThat(rc.getVirtualHosts(1).getRoutes(0).getRoute().hasRetryPolicy()).isFalse();
+  }
+
+  @Test
   void listenerWritesJsonAccessLog() throws Exception {
     var hcm = EdgeConfig.listener().getFilterChains(0).getFilters(0).getTypedConfig()
         .unpack(io.envoyproxy.envoy.extensions.filters.network.http_connection_manager.v3
@@ -68,7 +126,7 @@ class EdgeConfigTest {
   @Test
   void streamingBackendGetsNoRouteTimeoutButAnIdleTimeout() {
     var options = new BackendOptions(Map.of("llm", new BackendOptions.Options(
-        java.time.Duration.ZERO, java.time.Duration.ofSeconds(30), null)));
+        java.time.Duration.ZERO, java.time.Duration.ofSeconds(30), null, null)));
     var rc = EdgeConfig.routeTable(Map.of("llm.local", "llm", "a.local", "sales"), Map.of(), options);
     var llm = rc.getVirtualHostsList().stream().filter(v -> v.getName().equals("llm.local"))
         .findFirst().orElseThrow().getRoutes(0).getRoute();

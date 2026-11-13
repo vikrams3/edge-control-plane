@@ -36,6 +36,7 @@ flowchart LR
 - **Observability (kind):** Prometheus scrapes every Envoy (labelled by group) and the control plane's Micrometer metrics. Grafana has an "Edge control plane" dashboard showing req/s, 5xx ratio and p99 per group and per backend, plus rollouts and connected Envoys. Alertmanager has three rules: 5xx above 5%, stable Envoys disconnected, control plane down. Every Envoy writes one JSON access-log line per request.
 - **mTLS on xDS (kind):** the control plane serves xDS over TLS and requires an Envoy client certificate signed by a private xDS CA; Envoy accepts only a control plane whose certificate names `control-plane.edge.svc.cluster.local`. A client without a certificate is refused at the handshake. Docker Compose stays plaintext for simplicity.
 - **TLS:** with a certificate in `certs/` (`./scripts/gen-certs.sh` makes a self-signed `*.edge.local` one), every Envoy also serves HTTPS on `:10443`. The certificate is not in the bootstrap: the control plane sends it as an SDS secret on the same ADS stream, and reads the files on every push, so rotating means updating the Secret and pushing. Both listeners share one route table, access log and stat prefix.
+- **Cross-site failover:** a backend can name a `failover` address, the same service at another site (another region or cloud). Its Envoy cluster then has two priorities: the local endpoint is priority 0, the other site priority 1. Envoy health-checks both every 2 s and sends traffic to priority 1 only while priority 0 fails, then moves it back by itself. Requests that fail to connect in the seconds before the health check notices are retried on the other priority (`previous_priorities`), so users see no errors. The control plane only writes this config; failover and failback happen inside Envoy, even with the control plane down.
 - **State:** every rollout is a row in PostgreSQL (Spring Data JPA, schema by Flyway). On startup the control plane restores the last promoted routes and continues version numbers from the database. `POST /v1/rollouts/{version}/revert` rolls out an earlier version's routes again, through the canary like any other change.
 
 ## Code tour
@@ -97,14 +98,32 @@ kind delete cluster --name edge
 
 On kind, Grafana is at `localhost:3000` (admin/admin, dashboard "Edge control plane"), Prometheus at `:9090` and Alertmanager at `:9093`. To use the real-traffic probe: `kubectl -n edge set env deploy/control-plane EDGE_PROBE=prometheus`.
 
-Both options expose the control plane on `localhost:8080`, the stable Envoy on `localhost:10000` (HTTPS `:10443`) and the canary Envoy on `localhost:10001`. Try `curl --cacert certs/tls.crt --resolve sales.edge.local:10443:127.0.0.1 https://sales.edge.local:10443/`. Envoy's admin page is useful for debugging: `localhost:9901/config_dump` in Docker mode.
+### Option C: GKE, with a failover site in a second region
+
+```bash
+./scripts/gke-up.sh                                  # about 10 minutes the first time
+CONTEXT=gke-primary ./scripts/failover-demo.sh       # local sales down, then back
+./scripts/gke-down.sh                                # delete everything, so nothing keeps billing
+```
+
+`gke-up.sh` builds amd64 images on the Mac (Maven runs natively; only the run stage is amd64), pushes them to Artifact Registry, and creates:
+
+| Resource | Where | Cost |
+| --- | --- | --- |
+| Zonal GKE cluster `edge-primary`, one spot e2-standard-4 node, the same manifests as kind | us-central1-a | Cluster fee covered by the GKE free tier; node about $0.04/hour |
+| Spot e2-small VM `edge-dr-sales` running `sales`: the failover site | us-east1-b | About $0.01/hour; no public IP, pulls through Private Google Access |
+| Firewall rule: only the cluster's pod range may reach the VM on 8080 | VPC | Free |
+
+About $0.05/hour in total. Monitoring and Kafka are not installed on GKE, and Managed Prometheus and workload log ingestion are off, because they bill separately. The failover site is a plain VM, not a second cluster: a second cluster's fee ($0.10/hour) would cost more than everything else together, and a VM elsewhere is also what an AWS site would look like to Envoy.
+
+Both options A and B expose the control plane on `localhost:8080`, the stable Envoy on `localhost:10000` (HTTPS `:10443`) and the canary Envoy on `localhost:10001`. Try `curl --cacert certs/tls.crt --resolve sales.edge.local:10443:127.0.0.1 https://sales.edge.local:10443/`. Envoy's admin page is useful for debugging: `localhost:9901/config_dump` in Docker mode.
 
 ## Tests and CI
 
 | Command | What runs |
 | --- | --- |
-| `docker build ./control-plane` | 17 unit tests (the image does not build if one fails) |
-| `./scripts/integration-test.sh` | Unit tests plus 7 integration tests with Testcontainers: a real Envoy ACKs our config, routes by hostname, and NACKs an invalid route while it keeps serving the last good one; a real PostgreSQL with the Flyway schema |
+| `docker build ./control-plane` | 39 unit tests (the image does not build if one fails) |
+| `./scripts/integration-test.sh` | Unit tests plus 12 integration tests with Testcontainers: a real Envoy ACKs our config, routes by hostname, and NACKs an invalid route while it keeps serving the last good one; a real PostgreSQL with the Flyway schema |
 | `./scripts/integration-test.sh` also runs `ApplicationWiringIT` | Starts the whole app with real PostgreSQL once per probe setting and with the optimizer on. It catches bean wiring errors (it failed with `No default constructor found` when the postmortem's fix was removed, and caught a second instance later) |
 | `./scripts/smoke-test.sh` | Against the running kind cluster: health, promote, 400 on a typo, rollback, stable unaffected, HTTPS |
 | `./scripts/jenkins-up.sh` | Local Jenkins at `localhost:8090` (admin/admin), configured as code. The `Jenkinsfile` builds committed `main` (all three services, in parallel, each running its unit tests), runs the integration tests, deploys per-build image tags to kind, smoke-tests them, and runs `kubectl rollout undo` on all three if the smoke test fails. `SIMULATE_SMOKE_FAILURE=1 ./scripts/jenkins-up.sh` exercises that rollback |
@@ -242,6 +261,31 @@ Getting here took three tuning runs. Each row is the steady state at the end of 
 | No CPU limit, max 16 pods | 16 | 450 | 50 | 588 |
 | No CPU limit, Nagle off, max 16 pods | 16 | 680 | 20 | 893 |
 
+## Cross-site failover (kind and GKE)
+
+`./scripts/failover-demo.sh` sends 20 req/s to `sales.edge.local` through the stable Envoys from a pod in the cluster, scales the local `sales` to 0 pods at 20 s and back to 2 at 60 s, and counts which site answered every 5 s. On GKE the failover site is the VM in us-east1; on kind it is the namespace `edge-dr` (`k8s/failover-site/`).
+
+GKE, us-central1 failing over to us-east1:
+
+```text
+  15s local=  96 failover=   0 errors=  0
+[20s] local sales scaled to 0
+  25s local=  13 failover=   7 errors=  0
+  30s local=   0 failover=  51 errors=  0
+  ...
+[60s] local sales scaled to 2
+  70s local=  49 failover=  27 errors=  0
+  75s local=  96 failover=   0 errors=  0
+```
+
+| Run | Failover took | Failed requests | Failback |
+| --- | --- | --- | --- |
+| kind, health checks only | about 5 s | 18 | about 10 s, 0 errors |
+| kind, plus retry on the other priority | about 5 s | 0 | about 10 s, 0 errors |
+| GKE, us-central1 to us-east1 VM | about 5 s | 0 | about 10 s, 0 errors |
+
+While failed over, each request takes about 35 ms longer (the client sends one at a time, so it completed 57 requests per 5 s instead of 96): that is the round trip from us-central1 to us-east1, the real price of serving from the other region. Failback waits for 3 passing health checks, so a backend that is still starting does not get traffic too early.
+
 ## What I learned
 
 - **The data plane survives the control plane.** With the control plane stopped, Envoy keeps serving its last config. Separating the two is what makes the control plane safe to deploy.
@@ -251,6 +295,8 @@ Getting here took three tuning runs. Each row is the steady state at the end of 
 - **More pods did not help until the real bottlenecks were gone.** Raising the HPA cap from 8 to 16 lowered throughput, because each pod was throttled at its 500m CPU limit. Removing the limit (keeping the request the HPA scales on) took throughput from 339 to 450 req/s. The p50 still sat at exactly 50 ms, which I first blamed on throttling. That was wrong: one request at a time took 52 ms for 8 ms of work. Python writes headers and body separately, and on a kept-alive connection Nagle's algorithm plus delayed ACK held each reply about 40 ms. With `TCP_NODELAY` a request takes 8 ms through Envoy, and throughput reached about 690 req/s.
 - **Kubernetes balances connections, not requests.** The first simulated users kept connections alive, and kube-proxy pinned them at random, so the canary got 16% of traffic instead of 33%. Opening a connection per request fixed the split. Real clients behave the same way, which is why a request-level canary split belongs in Envoy (`weighted_clusters`), not in the Service.
 - **TLS added two surprises.** HTTPS clients on a non-default port send `Host: sales.edge.local:10443`, which matched no virtual host, so every request returned 404 until the connection manager set `strip_any_host_port`. Also, rotation is real: after `kubectl apply` of a new Secret, the kubelet took about 55 s to update the mounted files, and the next push served the new certificate without restarting Envoy. One caveat: the private key travels inside the xDS snapshot, so in production the xDS channel itself must use mTLS, or keys should come from a local SDS agent.
+- **Health checks alone still drop requests.** Envoy needs two failed checks, about 4 s, to mark the local site down, and requests in that window failed (18 in the first kind run). A retry on `connect-failure` that skips the priority which just failed closed the gap to zero. Retrying on `reset` too can repeat a request the backend had started, which is fine for these read-only backends and wrong for writes.
+- **Deleting a GKE cluster does not delete its disks.** The PersistentVolume behind Postgres outlives the cluster and keeps billing, so `gke-down.sh` deletes the namespace (and with it the claim and the disk) first.
 - **A synthetic probe is a blunt instrument.** It only tests the hostnames in the change and only `GET /`. Real traffic metrics from Envoy (Prometheus) are the better signal.
 
 ## Compared with a managed CDN
@@ -275,8 +321,8 @@ CloudFront, Cloud CDN, Cloudflare and Akamai solve a different, bigger problem: 
 
 ## Roadmap
 
-1. **Operate it like production:** GKE.
-2. **Multi-cloud:** cross-cloud failover from GKE to AWS by Envoy locality priority with active health checks.
+1. ~~**Operate it like production:** GKE.~~ Done: `scripts/gke-up.sh`.
+2. **Multi-cloud:** failover by Envoy locality priority with active health checks is done and tested across GCP regions. Next: AWS as the failover site, which only changes the `failover` address (over a VPN or a private link, not the public internet).
 3. **Hardening:** mTLS on xDS in Docker Compose too; a deeper health check than `/` for real backends.
 
 ## License

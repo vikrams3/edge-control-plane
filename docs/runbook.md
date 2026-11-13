@@ -46,6 +46,10 @@ The xDS channel is mTLS, so an expired or mismatched certificate looks exactly l
 | Drain a backend pool | Route its hostnames to another backend with a rollout. In a weighted pool, the optimizer ejects a member returning 50% or more 5xx by itself (weight 0) and re-tests it with backoff; `curl localhost:8080/v1/pools` shows the split, and the control-plane log says why (`grep Optimizer`). To take a healthy member out for maintenance, route the hostname to the other member. |
 | Rotate the TLS certificate | Update the `edge-tls` Secret, wait for the kubelet to sync it (about 1 minute), then push (any rollout) |
 | Switch probe | `kubectl -n edge set env deploy/control-plane EDGE_PROBE=synthetic\|prometheus\|kafka` |
+| Is a backend failed over? | `kubectl -n edge port-forward deploy/envoy-stable 9901`, then `curl -s localhost:9901/clusters \| grep -E '^sales::.*(health_flags\|priority)'`. Priority 0 `healthy` means local; `/failed_active_hc` on priority 0 means traffic is at the failover site. The access log's `upstream_host` shows which site served each request |
+| Fail back | Nothing to do: Envoy moves traffic back after 3 passing health checks (about 6 s) once local pods are ready. To keep traffic at the failover site during maintenance, scale the local backend to 0 |
+| Add a failover site | Set `edge.backend-options.<backend>.failover: host:port` (or env `EDGE_BACKENDOPTIONS_<BACKEND>_FAILOVER`) and restart the control plane; the health check uses the backend's `health-path`, or `/` |
+| Tear down GKE | `./scripts/gke-down.sh` (deletes the namespace first so the Postgres disk goes too), then check `gcloud compute disks list` is empty |
 | Check Envoy's live config | `kubectl -n edge port-forward deploy/envoy-stable 9901` then `localhost:9901/config_dump` |
 
 ## Emergency: change routes without the canary

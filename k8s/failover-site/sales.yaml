@@ -1,0 +1,37 @@
+# The failover site: the same sales backend in another region or cloud.
+# On kind it is a second namespace in the same cluster (reached by its Service name).
+# On GKE it runs in the second cluster behind an internal load balancer that the first
+# cluster reaches across regions over the VPC (global access), so it is never public.
+apiVersion: v1
+kind: Namespace
+metadata: {name: edge-dr}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: sales, namespace: edge-dr}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: sales}}
+  template:
+    metadata: {labels: {app: sales}}
+    spec:
+      containers:
+      - name: http-echo
+        image: hashicorp/http-echo
+        args: ["-text=hello from sales (failover site)", "-listen=:8080"]
+        ports: [{containerPort: 8080}]
+        resources:
+          requests: {cpu: 50m, memory: 32Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sales
+  namespace: edge-dr
+  annotations:
+    networking.gke.io/load-balancer-type: Internal
+    networking.gke.io/internal-load-balancer-allow-global-access: "true"
+spec:
+  type: LoadBalancer      # stays <pending> on kind, which is fine: kind uses the ClusterIP
+  selector: {app: sales}
+  ports: [{port: 8080}]
