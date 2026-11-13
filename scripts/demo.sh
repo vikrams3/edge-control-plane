@@ -15,7 +15,7 @@ curl -s "$CP/v1/routes"; echo
 pause
 
 step "Users hit the stable Envoy; it routes by hostname"
-echo -n "tableau.edge.local -> "; curl -s -H 'Host: tableau.edge.local' "$EDGE/"
+echo -n "tableau.edge.local -> "; curl -s -H 'Host: tableau.edge.local' "$EDGE/"; echo
 echo -n "sales.edge.local   -> "; curl -s -H 'Host: sales.edge.local' "$EDGE/"
 pause
 
@@ -49,5 +49,9 @@ if [ -f certs/tls.crt ]; then
   pause
 fi
 
-step "Rollout history"
-curl -s "$CP/v1/rollouts"; echo
+step "Rollout history (last 3; every rollout is a row in PostgreSQL)"
+curl -s "$CP/v1/rollouts" | python3 -c '
+import json, sys
+for r in json.load(sys.stdin)[-3:]:
+    print("v{version:<5} {outcome:<12} canary {canaryAck:<6} probe failures {probeFailures}/{probeRequests}  {routes}".format(**r))'
+
